@@ -1,0 +1,69 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Dakotajune\BlueprintPolicies;
+
+use Blueprint\Blueprint;
+use Dakotajune\BlueprintPolicies\Generators\PolicyGenerator;
+use Dakotajune\BlueprintPolicies\Lexers\PolicyLexer;
+use Dakotajune\BlueprintPolicies\Listeners\CleanUpOnErase;
+use Dakotajune\BlueprintPolicies\Support\NoticeBag;
+use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Console\Events\CommandStarting;
+use Illuminate\Support\ServiceProvider;
+
+/**
+ * Deliberately NOT a DeferrableProvider: Blueprint's own provider already defers Blueprint::class, and two
+ * deferred providers cannot both own one service. boot() must also run so the erase listener is registered
+ * before `blueprint:erase` starts.
+ */
+final class BlueprintPoliciesServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this->mergeConfigFrom(__DIR__ . '/../config/blueprint_policies.php', 'blueprint_policies');
+
+        $this->app->singleton(NoticeBag::class);
+
+        // extend() runs when Blueprint is resolved, whatever order the providers loaded in.
+        $this->app->extend(Blueprint::class, function (Blueprint $blueprint, $app): Blueprint {
+            $blueprint->registerLexer($app->make(PolicyLexer::class));
+            $blueprint->registerGenerator($app->make(PolicyGenerator::class));
+
+            return $blueprint;
+        });
+    }
+
+    public function boot(): void
+    {
+        $events = $this->app['events'];
+
+        // Resolve the listener only when erase really starts, not for every artisan command.
+        $events->listen(CommandStarting::class, function (CommandStarting $event): void {
+            if ($event->command === 'blueprint:erase') {
+                $this->app->make(CleanUpOnErase::class)->handle($event);
+            }
+        });
+
+        $events->listen(CommandFinished::class, function (CommandFinished $event): void {
+            if (! in_array($event->command, ['blueprint:build', 'blueprint:erase'], true)) {
+                return;
+            }
+
+            foreach ($this->app->make(NoticeBag::class)->pull() as $notice) {
+                $event->output->writeln("<comment>blueprint_policies:</comment> {$notice}");
+            }
+        });
+
+        if ($this->app->runningInConsole()) {
+            $this->publishes([
+                __DIR__ . '/../config/blueprint_policies.php' => config_path('blueprint_policies.php'),
+            ], 'blueprint-policies-config');
+
+            $this->publishes([
+                __DIR__ . '/../stubs/policy.stub' => base_path('stubs/blueprint/blueprint-policy.stub'),
+            ], 'blueprint-policies-stubs');
+        }
+    }
+}
