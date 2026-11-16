@@ -45,6 +45,25 @@ return [
     ],
 
     /*
+    | A parent class for every generated policy, e.g. 'BasePolicy' (App\Policies\BasePolicy) or '\App\Support\BasePolicy'.
+    | A policy overrides it with `extends:` in the draft (`extends: false` = none). null = no parent class.
+    | Applied when the file is created; an existing policy keeps the parent you gave it and gets a notice if it differs.
+    | Set it in the `nova` block for Nova policies alone (a bare name is then relative to App\Nova\Policies).
+    */
+    'extends' => null,
+
+    /*
+    | The rule for a standard ability (default_abilities, plus the soft-delete ones for soft-deleting models) that a
+    | policy does not list under `abilities:`. It still gets a method, so the policy states what happens.
+    |   'never'  (default) or false   returns false
+    |   'auth'                         any other rule from the README, e.g. 'role:admin'
+    |   true                           returns true for everyone (same as 'public')
+    |   null                           write only the abilities that are listed
+    | Does not apply to a policy without `abilities:` (default_rules does) or to one that uses `except:`.
+    */
+    'unlisted_abilities' => 'never',
+
+    /*
     | Used instead of a rule that cannot be built, e.g. `owner` on a model with no owner column.
     | Keep it "never": a missing rule should lock the ability, not open it. A notice says what happened.
     */

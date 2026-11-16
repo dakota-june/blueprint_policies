@@ -99,3 +99,17 @@ it('does not rewrite a property that lost its tag', function () {
 
     expect($result->changed)->toBeFalse()->and($result->notices)->toHaveCount(1)->and($result->source)->toBe($source);
 });
+
+it('edits a policy that extends a parent class, and strips it back to an empty class', function () {
+    $editor = new PolicyClassEditor();
+    $method = (new PolicyMemberBuilder())->ability('view', 'App\Models\User', 'App\Models\Post', 'post', false, 'true', 'auth', 'post', 'posts');
+    $source = "<?php\n\nnamespace App\\Policies;\n\nuse App\\Support\\Base;\n\nclass PostPolicy extends Base\n{\n}\n";
+
+    $built = $editor->update($source, 'PostPolicy', [], ['view' => $method]);
+    $stripped = $editor->stripGenerated($built->source, 'PostPolicy');
+
+    expect($built->source)->toContain('class PostPolicy extends Base')->toContain('function view(')
+        ->and(lints($built->source))->toBeTrue()
+        ->and($editor->hasDeveloperContent($stripped, 'PostPolicy'))->toBeFalse()
+        ->and($stripped)->toContain('class PostPolicy extends Base')->not->toContain('function view(');
+});

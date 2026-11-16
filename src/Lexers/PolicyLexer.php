@@ -19,6 +19,7 @@ use InvalidArgumentException;
  *       Post:
  *         owner: author_id
  *         before: admin
+ *         extends: BasePolicy      # parent class of the generated policy (new files only)
  *         abilities:
  *           viewAny: public
  *           update: owner | role:editor
@@ -44,7 +45,7 @@ final class PolicyLexer implements Lexer
 
     public const NOVA_SECTION = 'nova_policies';
 
-    private const OPTIONS = ['model', 'owner', 'before', 'abilities', 'except'];
+    private const OPTIONS = ['model', 'owner', 'before', 'abilities', 'except', 'extends'];
 
     private const LARAVEL_OPTIONS = ['controller'];
 
@@ -176,6 +177,7 @@ final class PolicyLexer implements Lexer
             except: $except,
             owner: $this->owner($definition, $key),
             before: $this->before($definition, $key),
+            extends: $this->extends($definition, $key),
             controller: $this->target === TargetConfig::NOVA ? null : $this->controller($definition, $key),
             target: $this->target,
             resource: $this->target === TargetConfig::NOVA ? $this->resource($definition, $key) : null,
@@ -326,6 +328,34 @@ final class PolicyLexer implements Lexer
         }
 
         return $text;
+    }
+
+    /**
+     * Absent = the configured default (`extends` in the config, if any); `false` = no parent class for this policy;
+     * `~` under nova_policies: = the web policy of the same model.
+     */
+    private function extends(array $definition, string $key): string|false|null
+    {
+        if (! array_key_exists('extends', $definition)) {
+            return null;
+        }
+
+        // `extends: ~` (or an empty `extends:`) under nova_policies: means "the web policy of this model".
+        if ($definition['extends'] === null) {
+            return $this->target === TargetConfig::NOVA ? PolicyDefinition::EXTENDS_WEB : null;
+        }
+
+        if ($definition['extends'] === false) {
+            return false;
+        }
+
+        $name = $this->string($definition['extends'], $key, 'extends');
+
+        if (! preg_match('/^\\\\?[A-Za-z_][A-Za-z0-9_]*(?:[\\\\\/][A-Za-z_][A-Za-z0-9_]*)*$/', $name)) {
+            throw new InvalidArgumentException("{$this->subject($key)}: extends [{$name}] is not a class name.");
+        }
+
+        return $name;
     }
 
     private function controller(array $definition, string $key): string|false|null

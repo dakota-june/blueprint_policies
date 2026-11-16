@@ -64,6 +64,7 @@ policies:
     model: Post              # when the key is not the model name
     owner: author_id         # column holding the owner's key; false = no owner. Default: detected (see config)
     before: admin            # a rule that grants everything (returns true) or falls through; false = none
+    extends: BasePolicy      # parent class of the generated policy; false = none. Default: config `extends`
     abilities: ...           # which abilities, and who may use them
     except: [forceDelete]    # remove from the default set (not combined with abilities)
     controller: Admin/PostController   # wire this controller; false = none. Default: PostController
@@ -81,7 +82,29 @@ abilities:
   import: { rule: admin, scope: class }   # acts on the class, not a record (viewAny and create always do)
 ```
 
+**Abilities you leave out.** The standard abilities (`default_abilities`, plus `restore`/`forceDelete` for soft-deleting models) that `abilities:` does not mention still get a method, answering with `unlisted_abilities` (config, default `never`, so `return false;`). Listing only what you allow is therefore enough:
+
+```yaml
+abilities:
+  viewAny: auth
+  view: auth        # create, update, delete, restore, forceDelete are written out and return false
+```
+
+`unlisted_abilities` takes `false`/`'never'` (the default), any rule (`'role:admin'`, `'owner'`), `true`, or `null` to write only what you list. A record rule such as `owner` cannot apply to `viewAny`/`create`; those two get the fallback and a notice. It does not apply to a policy without `abilities:` (the default rules do) or to one that uses `except:`. Controller actions follow the policy, so an unlisted `destroy` is blocked too.
+
 Block lists with dashes are not supported (Blueprint's YAML pre-processing strips them); use the map form or a flow list `[view, update]`.
+
+**`extends:`** makes the generated policy extend a class of your own, in `policies:` and `nova_policies:` alike. A name with a backslash is fully qualified (`\App\Support\BasePolicy`); a bare or slash name is relative to the policies namespace (`BasePolicy` is `App\Policies\BasePolicy`, or `App\Nova\Policies\BasePolicy` under `nova_policies:`). The import is added unless the parent is in the same namespace. `extends` in the config sets it for every policy (in the `nova` block for Nova only), and `extends: false` opts one policy out. It applies when the file is created; a policy that already exists is never rewritten, and you get a notice if it extends something else.
+
+**`extends: ~` under `nova_policies:`** makes the Nova policy extend the `policies:` policy of the same model (`App\Nova\Policies\PostPolicy extends \App\Policies\PostPolicy`), so shared logic lives in one place:
+
+```yaml
+nova_policies:
+  ContactType:
+    extends: ~          # or an empty `extends:`
+```
+
+If that web policy does not exist and `policies:` does not define it in the same draft, an empty one is created (with a notice, and `blueprint:erase` removes it again); a web policy you wrote is only extended, never changed. Because Nova passes the resource and the web policy takes the model, PHP only accepts an override whose parameters are the same or wider. Nova policies that extend the web policy are therefore written with `?User` (rules are guarded for a missing user) and an untyped record, e.g. `view(?User $user, $post)`. A parent you wrote by hand needs `?User` too, or PHP refuses to load the pair. `extends: ~` under `policies:` does nothing.
 
 **`before: false`** opts a policy out of a global `before` set in the config. `before: public` is refused (it would grant every ability to everyone).
 
@@ -165,7 +188,7 @@ php artisan vendor:publish --tag=blueprint-policies-stubs        # policies:
 php artisan vendor:publish --tag=blueprint-policies-nova-stubs   # nova_policies:
 ```
 
-See `config/blueprint_policies.php`. Top-level keys configure `policies:`. The `nova` block configures `nova_policies:`: its own `namespace`, `resource_namespace`, `auto_policies` and `registration`, plus any top-level key (`user_model`, `default_abilities`, `default_rules`, `fallback_rule`, `owner_columns`, `before`, `checks`) to change it for Nova alone. A key the block does not set falls back to the top-level value, and a key that is set wins even when it is `false` or `null`. Overriding one entry of `checks`, `controllers` or `nova` keeps the others' defaults.
+See `config/blueprint_policies.php`. Top-level keys configure `policies:`. The `nova` block configures `nova_policies:`: its own `namespace`, `resource_namespace`, `auto_policies` and `registration`, plus any top-level key (`user_model`, `default_abilities`, `default_rules`, `fallback_rule`, `owner_columns`, `before`, `unlisted_abilities`, `extends`, `checks`) to change it for Nova alone. A key the block does not set falls back to the top-level value, and a key that is set wins even when it is `false` or `null`. Overriding one entry of `checks`, `controllers` or `nova` keeps the others' defaults.
 
 ## Windows
 

@@ -37,13 +37,14 @@ final class PolicyMemberBuilder
         string $ruleSource,
         string $modelLabel,
         string $modelPlural,
+        bool $untypedSubject = false,
     ): string {
         $description = isset(self::DESCRIPTIONS[$name])
             ? sprintf(self::DESCRIPTIONS[$name], in_array($name, ['viewAny', 'create'], true) ? $modelPlural : $modelLabel)
             : 'Determine whether the user can ' . $this->words($name) . ($modelFqcn === null ? " {$modelPlural}." : " the {$modelLabel}.");
 
         $parameters = ($nullableUser ? '?' : '') . "{{ use:{$userFqcn} }} \$user"
-            . ($modelFqcn === null ? '' : ", {{ use:{$modelFqcn} }} \${$modelVariable}");
+            . ($modelFqcn === null ? '' : ($untypedSubject ? ", \${$modelVariable}" : ", {{ use:{$modelFqcn} }} \${$modelVariable}"));
 
         return $this->member($description, $ruleSource, "public function {$name}({$parameters}): bool", ["return {$expression};"]);
     }

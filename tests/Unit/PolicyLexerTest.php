@@ -90,3 +90,55 @@ it('rejects a policy defined twice within a section', function () {
     expect(fn () => lex(['nova_policies' => ['Post' => null, '\\Post' => null]]))
         ->toThrow(InvalidArgumentException::class, 'is defined more than once');
 });
+
+it('reads `extends` in both sections, resolving it against the policy namespace', function () {
+    $registry = lex([
+        'policies' => ['Post' => ['extends' => 'BasePolicy'], 'Tag' => ['extends' => '\\App\\Support\\Base'], 'Off' => ['extends' => false], 'Plain' => null],
+        'nova_policies' => ['Post' => ['extends' => 'BasePolicy']],
+    ]);
+    $web = $registry[PolicyLexer::REGISTRY_KEY];
+    $nova = $registry[PolicyLexer::NOVA_REGISTRY_KEY];
+
+    expect($web['App\Policies\PostPolicy']->extendsClass())->toBe('App\Policies\BasePolicy')
+        ->and($web['App\Policies\TagPolicy']->extendsClass())->toBe('App\Support\Base')
+        ->and($web['App\Policies\OffPolicy']->extendsClass())->toBeNull()
+        ->and($web['App\Policies\PlainPolicy']->extendsClass())->toBeNull()
+        ->and($nova['App\Nova\Policies\PostPolicy']->extendsClass())->toBe('App\Nova\Policies\BasePolicy');
+});
+
+it('falls back to the configured `extends`, per target, and lets `extends: false` opt out', function () {
+    config(['blueprint_policies.extends' => 'BasePolicy', 'blueprint_policies.nova.extends' => '\\App\\Nova\\Base']);
+
+    $registry = lex(['policies' => ['Post' => null, 'Off' => ['extends' => false]], 'nova_policies' => ['Post' => null]]);
+
+    expect($registry[PolicyLexer::REGISTRY_KEY]['App\Policies\PostPolicy']->extendsClass())->toBe('App\Policies\BasePolicy')
+        ->and($registry[PolicyLexer::REGISTRY_KEY]['App\Policies\OffPolicy']->extendsClass())->toBeNull()
+        ->and($registry[PolicyLexer::NOVA_REGISTRY_KEY]['App\Nova\Policies\PostPolicy']->extendsClass())->toBe('App\Nova\Base');
+});
+
+it('refuses an `extends` that is not a class name', function () {
+    expect(fn () => lex(['policies' => ['Post' => ['extends' => 'Bad Name']]]))
+        ->toThrow(InvalidArgumentException::class, 'extends [Bad Name] is not a class name');
+});
+
+it('reads `extends: ~` under nova_policies: as the web policy of the same model, and ignores it under policies:', function () {
+    $registry = lex([
+        'policies' => ['Post' => ['extends' => null]],
+        'nova_policies' => ['Post' => ['extends' => null], 'Blog/Tag' => ['extends' => null], 'Plain' => null],
+    ]);
+    $nova = $registry[PolicyLexer::NOVA_REGISTRY_KEY];
+
+    expect($nova['App\Nova\Policies\PostPolicy']->extendsWebPolicy())->toBeTrue()
+        ->and($nova['App\Nova\Policies\PostPolicy']->extendsClass())->toBe('App\Policies\PostPolicy')
+        ->and($nova['App\Nova\Policies\Blog\TagPolicy']->extendsClass())->toBe('App\Policies\Blog\TagPolicy')
+        ->and($nova['App\Nova\Policies\PlainPolicy']->extendsWebPolicy())->toBeFalse()
+        ->and($registry[PolicyLexer::REGISTRY_KEY]['App\Policies\PostPolicy']->extendsClass())->toBeNull();
+});
+
+it('follows the configured web namespace for the parent of a Nova policy', function () {
+    config(['blueprint.policy_namespace' => null, 'blueprint_policies.namespace' => 'Auth', 'blueprint_policies.nova.namespace' => 'Nova\\Auth']);
+
+    $nova = lex(['nova_policies' => ['Post' => ['extends' => null]]])[PolicyLexer::NOVA_REGISTRY_KEY];
+
+    expect($nova['App\Nova\Auth\PostPolicy']->extendsClass())->toBe('App\Auth\PostPolicy');
+});

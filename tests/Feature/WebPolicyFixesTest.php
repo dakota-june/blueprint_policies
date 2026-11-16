@@ -88,3 +88,46 @@ it('keeps a CRLF controller intact and CRLF', function () {
 
     expect(read('app/Http/Controllers/PostController.php'))->toBe($crlf);
 });
+
+it('gives abilities you did not list a method that returns false, and lets the default be configured', function () {
+    $this->build($this->draft(['Post' => ['abilities' => ['view' => 'auth']]]), ['policies']);
+    $policy = preg_replace('/\s+/', ' ', read('app/Policies/PostPolicy.php'));
+
+    expect($policy)->toContain('public function view(')
+        ->and($policy)->toMatch('/function delete\([^)]*\): bool \{[^}]*return false;/')
+        ->and($policy)->toMatch('/function forceDelete\([^)]*\): bool \{[^}]*return false;/');
+
+    config(['blueprint_policies.unlisted_abilities' => 'role:admin']);
+    $this->build($this->draft(['Post' => ['abilities' => ['view' => 'auth']]]), ['policies']);
+
+    expect(read('app/Policies/PostPolicy.php'))->toContain("hasRole('admin')");
+
+    config(['blueprint_policies.unlisted_abilities' => null]);
+    $this->build($this->draft(['Post' => ['abilities' => ['view' => 'auth']]]), ['policies']);
+
+    expect(read('app/Policies/PostPolicy.php'))->not->toContain('function delete(');
+});
+
+it('extends a custom base class per policy, importing it when it lives elsewhere', function () {
+    $this->build($this->draft([
+        'Post' => ['extends' => 'BasePolicy', 'abilities' => ['view' => 'auth']],
+        'Tag' => ['extends' => '\\App\\Support\\BasePolicy', 'abilities' => ['view' => 'auth']],
+        'Comment' => ['extends' => false, 'abilities' => ['view' => 'auth']],
+    ]), ['policies']);
+
+    expect(read('app/Policies/PostPolicy.php'))->toContain('class PostPolicy extends BasePolicy')->not->toContain('use App\Policies\BasePolicy;')
+        ->and(read('app/Policies/TagPolicy.php'))->toContain('use App\Support\BasePolicy;')->toContain('class TagPolicy extends BasePolicy')
+        ->and(read('app/Policies/CommentPolicy.php'))->not->toContain('extends')
+        ->and(lints(read('app/Policies/TagPolicy.php')))->toBeTrue();
+});
+
+it('leaves an existing policy alone when it does not extend the requested class, and says so', function () {
+    @mkdir(base_path('app/Policies'), 0777, true);
+    $own = "<?php\n\nnamespace App\\Policies;\n\nclass PostPolicy\n{\n}\n";
+    file_put_contents(base_path('app/Policies/PostPolicy.php'), $own);
+
+    $this->build($this->draft(['Post' => ['extends' => 'BasePolicy', 'abilities' => ['view' => 'auth']]]), ['policies']);
+
+    expect(read('app/Policies/PostPolicy.php'))->not->toContain('extends')
+        ->and(implode("\n", $this->notices()))->toContain('does not extend App\\Policies\\BasePolicy');
+});

@@ -141,3 +141,76 @@ it('keeps the two auto_policies switches apart', function () {
     expect(base_path('app/Nova/Policies/PostPolicy.php'))->toBeFile()
         ->and(base_path('app/Policies/PostPolicy.php'))->not->toBeFile();
 });
+
+it('denies a Nova force delete you leave out, with a method that says so', function () {
+    $this->writeNovaResources(['Tag']);
+    $this->build($this->novaDraft(['Tag' => ['abilities' => ['viewAny' => 'auth', 'view' => 'auth', 'forceDelete' => 'never']]]));
+
+    $policy = preg_replace('/\s+/', ' ', read('app/Nova/Policies/TagPolicy.php'));
+
+    expect($policy)->toMatch('/function forceDelete\([^)]*\): bool \{[^}]*return false;/')
+        ->and($policy)->toMatch('/function delete\([^)]*\): bool \{[^}]*return false;/');
+});
+
+it('lets the nova block set its own unlisted_abilities', function () {
+    config(['blueprint_policies.unlisted_abilities' => null, 'blueprint_policies.nova.unlisted_abilities' => 'never']);
+    $this->build($this->novaDraft(['Post' => ['abilities' => ['view' => 'auth']]], ['Post' => ['abilities' => ['view' => 'auth']]]));
+
+    expect(read('app/Policies/PostPolicy.php'))->not->toContain('function delete(')
+        ->and(read('app/Nova/Policies/PostPolicy.php'))->toContain('function delete(');
+});
+
+it('extends a base class for Nova policies, resolved against the Nova policy namespace', function () {
+    $this->writeNovaResources(['Post']);
+    config(['blueprint_policies.nova.extends' => 'NovaBasePolicy']);
+
+    $this->build($this->novaDraft(['Post' => ['abilities' => ['view' => 'auth']], 'Tag' => ['extends' => false]]));
+
+    expect(read('app/Nova/Policies/PostPolicy.php'))->toContain('class PostPolicy extends NovaBasePolicy')
+        ->and(read('app/Nova/Policies/TagPolicy.php'))->not->toContain('extends');
+});
+
+it('extends the web policy with `extends: ~`, creating it empty when it does not exist', function () {
+    $this->writeNovaResources(['Post']);
+
+    $this->build($this->novaDraft(['Post' => ['extends' => null, 'abilities' => ['view' => 'auth', 'update' => 'owner']]]));
+
+    $nova = read('app/Nova/Policies/PostPolicy.php');
+    $web = read('app/Policies/PostPolicy.php');
+
+    expect($nova)->toContain('class PostPolicy extends \App\Policies\PostPolicy')
+        ->toContain('public function view(?User $user, $post): bool')
+        ->and(lints($nova))->toBeTrue()
+        ->and($web)->not->toContain('function ')
+        ->and(lints($web))->toBeTrue()
+        ->and(implode("\n", $this->notices()))->toContain('app/Policies/PostPolicy.php (empty)');
+});
+
+it('lets both policies load together when the Nova one extends the web one', function () {
+    $this->writeNovaResources(['Post']);
+
+    $this->build($this->novaDraft(
+        ['Post' => ['extends' => null, 'abilities' => ['view' => 'auth', 'update' => 'owner | role:y']]],
+        ['Post' => ['abilities' => ['view' => 'public', 'update' => 'owner']]],
+    ));
+
+    // Loading the pair is the real test: PHP refuses an override that narrows its parent's parameter types.
+    require_once base_path('app/Policies/PostPolicy.php');
+    require_once base_path('app/Nova/Policies/PostPolicy.php');
+
+    expect(class_exists(\App\Nova\Policies\PostPolicy::class))->toBeTrue()
+        ->and(is_subclass_of(\App\Nova\Policies\PostPolicy::class, \App\Policies\PostPolicy::class))->toBeTrue();
+});
+
+it('never touches a web policy you wrote, and records only the empty one we created (so erase removes only that)', function () {
+    $this->writeNovaResources(['Post', 'Tag']);
+    @mkdir(base_path('app/Policies'), 0777, true);
+    $own = "<?php\n\nnamespace App\\Policies;\n\nclass PostPolicy\n{\n    public function mine(): bool\n    {\n        return true;\n    }\n}\n";
+    file_put_contents(base_path('app/Policies/PostPolicy.php'), $own);
+
+    $this->build($this->novaDraft(['Post' => ['extends' => null], 'Tag' => ['extends' => null]]));
+
+    expect(read('app/Policies/PostPolicy.php'))->toBe($own)
+        ->and(base_path('app/Policies/TagPolicy.php'))->toBeFile()
+        ->and(read('.blueprint_policies'))->toContain('app/Policies/TagPolicy.php')->not->toContain('app/Policies/PostPolicy.php');
+});

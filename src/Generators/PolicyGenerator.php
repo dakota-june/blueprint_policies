@@ -144,6 +144,10 @@ final class PolicyGenerator implements Generator
             $next->recordPolicy($path, $definition->className(), $created, $definition->target());
 
             if ($definition->isNova()) {
+                if ($definition->extendsWebPolicy()) {
+                    $this->ensureWebPolicy($definition, $definitions, $previous, $next, $active, $output);
+                }
+
                 $this->registerWithResource($definition, $path, $next, $output);
 
                 continue;
@@ -171,6 +175,46 @@ final class PolicyGenerator implements Generator
         $this->manifests->save($next);
 
         return $output;
+    }
+
+    /**
+     * `extends: ~` under nova_policies: the web policy must exist. When `policies:` does not define it and no file is
+     * there, an empty one is created (the Nova policy brings its own methods). A file you wrote is only ever extended.
+     *
+     * @param  array<int, PolicyDefinition>  $definitions
+     * @param  array<int, string>  $active
+     * @param  array<string, array<int, array<int, string>>>  $output
+     */
+    private function ensureWebPolicy(PolicyDefinition $nova, array $definitions, Manifest $previous, Manifest $next, array &$active, array &$output): void
+    {
+        $fqcn = $nova->webPolicyClass();
+
+        foreach ($definitions as $other) {
+            if (! $other->isNova() && $other->fullyQualifiedClassName() === $fqcn) {
+                return; // `policies:` writes it in this same build
+            }
+        }
+
+        $path = $this->relativePath($fqcn);
+        $absolute = base_path($path);
+        $existed = $this->files->exists($absolute);
+        $ours = ! $existed || ($previous->policy($path)['created'] ?? false);
+
+        if (! $existed) {
+            $this->files->ensureDirectoryExists(dirname($absolute));
+            $this->files->put($absolute, str_replace(
+                ['{{ namespace }}', '{{ class }}'],
+                [substr($fqcn, 0, (int) strrpos($fqcn, '\\')), $nova->className()],
+                $this->files->get($this->stubPath($nova)),
+            ));
+            $this->notices->add("Created {$path} (empty) because {$nova->className()} under `nova_policies:` extends it. Add your shared logic there.");
+        }
+
+        if ($ours) {
+            $active[] = $path;
+            $next->recordPolicy($path, $nova->className(), true, TargetConfig::LARAVEL);
+            $output[$existed ? 'updated' : 'created'][] = ['Policy', $path];
+        }
     }
 
     /** @return array<int, string> */
@@ -275,20 +319,30 @@ final class PolicyGenerator implements Generator
         $target = $definition->target();
         $listed = $definition->abilities();
 
+        $standard = (array) TargetConfig::get($target, 'default_abilities', ['viewAny', 'view', 'create', 'update', 'delete']);
+
+        if ($model?->usesSoftDeletes()) {
+            $standard = [...$standard, ...(array) TargetConfig::get($target, 'soft_delete_abilities', ['restore', 'forceDelete'])];
+        }
+
+        $standard = array_unique($standard);
+        $scopeOf = static fn (string $name): string => in_array($name, PolicyDefinition::CLASS_ABILITIES, true) ? PolicyDefinition::CLASS_SCOPE : PolicyDefinition::INSTANCE_SCOPE;
+
         if ($listed === null) {
-            $names = (array) TargetConfig::get($target, 'default_abilities', ['viewAny', 'view', 'create', 'update', 'delete']);
-
-            if ($model?->usesSoftDeletes()) {
-                $names = [...$names, ...(array) TargetConfig::get($target, 'soft_delete_abilities', ['restore', 'forceDelete'])];
-            }
-
             $listed = [];
 
-            foreach (array_diff(array_unique($names), $definition->except()) as $name) {
-                $listed[$name] = [
-                    'rule' => null,
-                    'scope' => in_array($name, PolicyDefinition::CLASS_ABILITIES, true) ? PolicyDefinition::CLASS_SCOPE : PolicyDefinition::INSTANCE_SCOPE,
-                ];
+            foreach (array_diff($standard, $definition->except()) as $name) {
+                $listed[$name] = ['rule' => null, 'scope' => $scopeOf($name)];
+            }
+        } else {
+            // Abilities you did not list still get a method, answering with `unlisted_abilities` (default: never, so
+            // false). Without it Laravel would deny them anyway, but a written-out method says so. null = write only what is listed.
+            $unlisted = $this->unlistedRule($target);
+
+            if ($unlisted !== null) {
+                foreach (array_diff($standard, array_keys($listed)) as $name) {
+                    $listed[$name] = ['rule' => $unlisted, 'scope' => $scopeOf($name), 'unlisted' => true];
+                }
             }
         }
 
@@ -298,7 +352,7 @@ final class PolicyGenerator implements Generator
         $locked = [];
 
         foreach ($listed as $name => $spec) {
-            $explicit = $spec['rule'] !== null;
+            $explicit = $spec['rule'] !== null && ! ($spec['unlisted'] ?? false);
             $text = $spec['rule'] ?? ($defaults[$name] ?? null);
 
             if ($definition->isNova() && preg_match(self::NOVA_RELATIONSHIP_METHOD, (string) $name)) {
@@ -315,7 +369,15 @@ final class PolicyGenerator implements Generator
 
             $rule = $this->parse($text, $class, $name);
 
+            if (($spec['unlisted'] ?? false) && $spec['scope'] === PolicyDefinition::CLASS_SCOPE && $rule->needsModel()) {
+                // `unlisted_abilities: owner` makes sense for update/delete, but viewAny/create have no record to look at.
+                $this->notices->add("{$class}: [{$name}] acts on the class, so `unlisted_abilities` [{$text}] cannot apply to it; it got `{$fallback}`.");
+                $text = $fallback;
+                $rule = $this->parse($text, $class, $name);
+            }
+
             $this->assertScope($rule, $spec['scope'], $class, $name);
+
             $this->assertStateColumns($rule, $model, $class, $name);
 
             if ($ownerColumn === null && $this->usesOwner($rule)) {
@@ -331,7 +393,9 @@ final class PolicyGenerator implements Generator
                 $rule = $this->parse($text, $class, $name);
             }
 
-            $nullable = $rule->allowsGuests();
+            // A policy that extends the web policy overrides methods typed `?User` / with the model, so it may only widen
+            // those types: always `?User` here (the rule is guarded to match) and an untyped record.
+            $nullable = $rule->allowsGuests() || $definition->extendsWebPolicy();
 
             $abilities[$name] = [
                 'scope' => $spec['scope'],
@@ -350,6 +414,19 @@ final class PolicyGenerator implements Generator
         }
 
         return $abilities;
+    }
+
+    /** The rule for standard abilities the draft left out: `false` = never, `true` = public, a rule string as is, null = none. */
+    private function unlistedRule(string $target): ?string
+    {
+        $value = TargetConfig::get($target, 'unlisted_abilities', 'never');
+
+        return match (true) {
+            $value === null => null,
+            $value === false => 'never',
+            $value === true => 'public',
+            default => (string) $value,
+        };
     }
 
     /** @return array{source: string, expression: string}|null */
@@ -515,10 +592,16 @@ final class PolicyGenerator implements Generator
                 $ability['source'],
                 $plan['label'],
                 $plan['plural'],
+                $definition->extendsWebPolicy(),
             );
         }
 
         $source = $existed ? $this->files->get($absolute) : $this->newFile($definition);
+
+        if ($existed) {
+            $this->checkParent($definition, $source);
+        }
+
         $result = $this->editor->update($source, $definition->className(), [], $methods);
 
         foreach ($result->notices as $notice) {
@@ -536,11 +619,57 @@ final class PolicyGenerator implements Generator
 
     private function newFile(PolicyDefinition $definition): string
     {
-        return str_replace(
+        $source = str_replace(
             ['{{ namespace }}', '{{ class }}'],
             [$definition->fullyQualifiedNamespace(), $definition->className()],
             $this->files->get($this->stubPath($definition)),
         );
+
+        $parent = $definition->extendsClass();
+
+        return $parent === null ? $source : $this->withParent($source, $definition, $parent);
+    }
+
+    /**
+     * `class PostPolicy` becomes `class PostPolicy extends BasePolicy`, with an import unless the parent lives in the
+     * same namespace. Only ever applied to a file we create: a class that already exists keeps the parent you gave it.
+     */
+    private function withParent(string $source, PolicyDefinition $definition, string $parent): string
+    {
+        $source = str_replace("\r\n", "\n", $source);
+        $short = substr($parent, (int) strrpos('\\' . $parent, '\\'));
+        $namespace = $definition->fullyQualifiedNamespace();
+        $sameNamespace = substr($parent, 0, max(0, strlen($parent) - strlen($short) - 1)) === $namespace;
+        $clash = $short === $definition->className();
+        $reference = $clash ? '\\' . $parent : $short;
+
+        $source = preg_replace('/^(class\s+' . preg_quote($definition->className(), '/') . ')\b/m', '$1 extends ' . $reference, $source, 1) ?? $source;
+
+        if (! $clash && ! $sameNamespace) {
+            $source = preg_replace('/^(namespace\s+[^;]+;\n)/m', '$1' . "\n" . 'use ' . $parent . ';' . "\n", $source, 1) ?? $source;
+        }
+
+        return $source;
+    }
+
+    /** Says so when an existing policy does not extend the class the draft (or config) names; the file is left as it is. */
+    private function checkParent(PolicyDefinition $definition, string $source): void
+    {
+        $parent = $definition->extendsClass();
+
+        if ($parent === null) {
+            return;
+        }
+
+        $found = preg_match('/\bclass\s+' . preg_quote($definition->className(), '/') . '\s+extends\s+([\\\\\w]+)/', $source, $m) ? ltrim($m[1], '\\') : null;
+        $short = substr($parent, (int) strrpos('\\' . $parent, '\\'));
+
+        if ($found === null || ($found !== $parent && substr($found, (int) strrpos('\\' . $found, '\\')) !== $short)) {
+            $this->notices->add(
+                "{$definition->className()} already exists and does not extend {$parent}"
+                . ($found === null ? '' : " (it extends {$found})") . '; the file was left as it is. Add the `extends` yourself, or delete the file to have it generated again.',
+            );
+        }
     }
 
     private function stubPath(PolicyDefinition $definition): string

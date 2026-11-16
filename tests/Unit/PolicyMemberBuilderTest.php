@@ -25,3 +25,9 @@ it('types the second argument with whatever class it is given', function () {
 
     expect($member)->toContain('public function view({{ use:App\Models\User }} $user, {{ use:App\Nova\Post }} $post): bool');
 });
+
+it('can leave the record untyped, so an override may widen its parent\'s parameter', function () {
+    $member = (new PolicyMemberBuilder())->ability('update', 'App\Models\User', 'App\Nova\Post', 'post', true, 'true', 'auth', 'post', 'posts', true);
+
+    expect($member)->toContain('public function update(?{{ use:App\Models\User }} $user, $post): bool')->not->toContain('App\Nova\Post');
+});

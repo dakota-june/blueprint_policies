@@ -9,6 +9,10 @@
 - `nova` config block with per-target overrides and fallback to the top-level values; `resource:` option.
 - `before: false` opts a policy out of a global `before`.
 
+- `extends: ~` under `nova_policies:` extends the web policy of the same model (created empty if missing).
+- `extends:` option (and `extends` config, per target): the generated policy extends a custom class.
+- `unlisted_abilities` config (default `never`): standard abilities missing from `abilities:` are written out and answer with it.
+
 ### Fixed
 - `auth` is a real check (`$user !== null`) wherever guests can reach the method; it no longer lets a guest through
   `auth & state:... | public & ...`.
@@ -20,7 +24,7 @@
 - Policy imports are added only for members that are actually written.
 - Rule text can no longer close the generated docblock.
 - Config is merged one level deeper (`checks`, `controllers`, `nova`) so overriding one key keeps the rest.
-- Windows: CRLF files stay CRLF; backslash paths in `.blueprint` are matched.
+- Windows: CRLF files stay CRLF, files that mix CRLF and LF (Blueprint's own controllers) keep each untouched line's ending, and backslash paths in `.blueprint` are matched.
 
 ### Changed
 - Minimum PHP is 8.2 (Laravel 11's minimum).
