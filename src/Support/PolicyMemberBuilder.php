@@ -23,7 +23,7 @@ final class PolicyMemberBuilder
     ];
 
     /**
-     * @param  string|null  $modelFqcn  null for abilities that act on the class (viewAny, create)
+     * @param  string|null  $modelFqcn  the class the method receives after the user (the model, or the Nova resource); null for abilities that act on the class (viewAny, create)
      * @param  string  $modelLabel  lower-case words, e.g. "blog post"
      * @param  string  $modelPlural  used by viewAny / create, e.g. "blog posts"
      */
@@ -66,7 +66,7 @@ final class PolicyMemberBuilder
             "     * {$description}",
             '     *',
             '     * ' . self::TAG,
-            '     * Rule: ' . $ruleSource,
+            '     * Rule: ' . $this->comment($ruleSource),
             '     */',
             "    {$signature}",
             '    {',
@@ -79,6 +79,12 @@ final class PolicyMemberBuilder
         $lines[] = '    }';
 
         return implode("\n", $lines);
+    }
+
+    /** The rule is the developer's text; keep it on one line and unable to close the docblock it sits in. */
+    private function comment(string $text): string
+    {
+        return trim((string) preg_replace('/\s+/', ' ', str_replace('*/', '* /', $text)));
     }
 
     /** "publishDraft" => "publish draft" */

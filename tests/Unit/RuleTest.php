@@ -43,12 +43,38 @@ it('guards user checks when guests are allowed', function () {
         ->and(render('!owner', true))->toBe('($user === null || $user->getKey() !== $post->user_id)');
 });
 
+it('keeps `auth` a real check when guests can reach the method', function () {
+    // A method that takes ?User can be called for a guest, so "signed in" has to be written out.
+    expect(render('auth', true))->toBe('$user !== null')
+        ->and(render('auth & state:status=draft | public & role:a', true))
+        ->toBe("(\$user !== null && \$post->status === 'draft') || \$user !== null && \$user->hasRole('a')")
+        ->and(render('public & auth', true))->toBe('$user !== null');
+});
+
+it('does not repeat the signed-in check when another term already needs a user', function () {
+    expect(render('auth & owner', true))->toBe('$user !== null && $user->getKey() === $post->user_id')
+        ->and(render('auth & role:a', true))->toBe("\$user !== null && \$user->hasRole('a')")
+        ->and(render('auth & !role:a', true))->toBe("\$user !== null && ! (\$user !== null && \$user->hasRole('a'))");
+});
+
+it('folds `auth` away when the method takes a plain User', function () {
+    // `User $user` cannot be called for a guest at all, so there is nothing left to check.
+    expect(render('auth'))->toBe('true')
+        ->and(render('auth | role:a'))->toBe('true')
+        ->and(render('auth & owner'))->toBe('$user->getKey() === $post->user_id');
+});
+
 it('renders state checks, with != and ! cancelling out', function () {
     expect(render('state:status=draft'))->toBe("\$post->status === 'draft'")
         ->and(render('state:status=a,b'))->toBe("in_array(\$post->status, ['a', 'b'], true)")
         ->and(render('state:status!=a'))->toBe("\$post->status !== 'a'")
         ->and(render('!state:status=a'))->toBe("\$post->status !== 'a'")
         ->and(render('!state:status!=a'))->toBe("\$post->status === 'a'");
+});
+
+it('reads through whatever expression it is given for the record, e.g. a Nova resource\'s model()', function () {
+    expect(render('owner & state:status=draft', false, '$post->model()'))
+        ->toBe('$user->getKey() === $post->model()->user_id && $post->model()->status === \'draft\'');
 });
 
 it('writes numbers and booleans as such', function () {

@@ -13,7 +13,8 @@ use PhpToken;
  * Adds / removes `#[UsePolicy(PostPolicy::class)]` on an Eloquent model source string.
  *
  * Token-aware (modifiers, docblocks, other attributes, existing imports and short-name clashes) and idempotent.
- * A model that already names a different policy is left alone: that is the developer's decision.
+ * A model that already names a different policy is left alone: that is the developer's decision. Files with
+ * CRLF line endings keep them.
  */
 final class PolicyAttributeInjector
 {
@@ -27,12 +28,14 @@ final class PolicyAttributeInjector
 
     public function inject(string $source, string $modelClass, string $policyFqcn): InjectionResult
     {
+        $original = $source;
+        [$source, $eol] = $this->toLf($source);
         $policyFqcn = ltrim($policyFqcn, '\\');
         $tokens = PhpToken::tokenize($source);
         $classIdx = $this->findClass($tokens, $modelClass);
 
         if ($classIdx === null) {
-            return new InjectionResult($source, InjectionResult::CLASS_NOT_FOUND);
+            return new InjectionResult($original, InjectionResult::CLASS_NOT_FOUND);
         }
 
         $declStart = $this->declarationStart($tokens, $classIdx);
@@ -40,7 +43,7 @@ final class PolicyAttributeInjector
 
         if ($existing !== null) {
             return new InjectionResult(
-                $source,
+                $original,
                 $this->matches($existing[2], $policyFqcn, $source, $tokens, $classIdx) ? InjectionResult::UNCHANGED : InjectionResult::CONFLICT,
             );
         }
@@ -64,7 +67,7 @@ final class PolicyAttributeInjector
             $edits[] = $this->importEdit($tokens, $classIdx, array_values(array_unique($newImports)));
         }
 
-        return new InjectionResult($this->apply($source, $edits), InjectionResult::INSERTED, [self::ATTRIBUTE_FQCN, $policyFqcn]);
+        return new InjectionResult($this->fromLf($this->apply($source, $edits), $eol), InjectionResult::INSERTED, [self::ATTRIBUTE_FQCN, $policyFqcn]);
     }
 
     /**
@@ -74,18 +77,20 @@ final class PolicyAttributeInjector
      */
     public function remove(string $source, string $modelClass, string $policyFqcn, array $uses = []): string
     {
+        $original = $source;
+        [$source, $eol] = $this->toLf($source);
         $policyFqcn = ltrim($policyFqcn, '\\');
         $tokens = PhpToken::tokenize($source);
         $classIdx = $this->findClass($tokens, $modelClass);
 
         if ($classIdx === null) {
-            return $source;
+            return $original;
         }
 
         $existing = $this->existing($source, $tokens, $classIdx, $this->declarationStart($tokens, $classIdx));
 
         if ($existing === null || ! $this->matches($existing[2], $policyFqcn, $source, $tokens, $classIdx)) {
-            return $source;
+            return $original;
         }
 
         [$start, $length] = $existing;
@@ -99,7 +104,7 @@ final class PolicyAttributeInjector
             $end++;
         }
 
-        return $this->removeImportsIfUnused(substr_replace($source, '', $start, $end - $start), $uses);
+        return $this->fromLf($this->removeImportsIfUnused(substr_replace($source, '', $start, $end - $start), $uses), $eol);
     }
 
     /**

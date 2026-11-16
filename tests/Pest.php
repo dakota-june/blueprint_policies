@@ -32,7 +32,7 @@ function snapshot(): array
     $files = [];
     $root = str_replace('\\', '/', base_path()) . '/';
 
-    foreach (['app/Policies', 'app/Auth', 'app/Http/Controllers', 'app/Models', 'app/Providers'] as $directory) {
+    foreach (['app/Policies', 'app/Auth', 'app/Nova', 'app/Http/Controllers', 'app/Models', 'app/Providers'] as $directory) {
         if (! is_dir(base_path($directory))) {
             continue;
         }

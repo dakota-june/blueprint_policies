@@ -12,14 +12,20 @@ use InvalidArgumentException;
  *  - Constant terms are folded: `public | owner` is just `true`, `never & owner` drops out.
  *  - When guests are allowed ($user may be null) every user-dependent term is guarded, so a guest is
  *    denied by the terms that need a user instead of crashing with "method on null".
+ *  - `auth` means "signed in". A method that takes `User $user` cannot be called for a guest, so there `auth`
+ *    folds away; a method that takes `?User $user` can, so there `auth` is written out as `$user !== null`.
+ *  - A negated user check (`!role:banned`) is true for a guest, who by definition does not have the role.
  */
 final class RuleRenderer
 {
+    /** Terms that are false for a guest, so a group holding one already needs a signed-in user. */
+    private const USER_TERMS = ['owner', 'role', 'permission', 'admin', 'verified'];
+
     /** @param  array<string, string>  $checks  term => PHP template; `{{ value }}` is the quoted argument */
     public function __construct(private readonly array $checks) {}
 
     /**
-     * @param  string|null  $modelVariable  e.g. "$post"; null for abilities that receive no model
+     * @param  string|null  $modelVariable  e.g. "$post" (or "$post->model()"); null for abilities that receive no model
      * @param  string|null  $ownerColumn  column holding the owner's key; required to render `owner`
      * @param  int  $indent  column the expression starts at, used when the line has to wrap
      *
@@ -31,14 +37,23 @@ final class RuleRenderer
 
         foreach ($rule->groups as $group) {
             $parts = [];
+            $impliesUser = $this->impliesUser($group);
 
             foreach ($group as $term) {
                 if ($term->name === 'never') {
                     continue 2;                              // this whole AND-group is false
                 }
 
-                if ($term->name === 'public' || $term->name === 'auth') {
+                if ($term->name === 'public') {
                     continue;                                // always true: adds nothing to an AND-group
+                }
+
+                if ($term->name === 'auth') {
+                    if ($nullableUser && ! $impliesUser) {
+                        $parts[] = '$user !== null';         // a guest can reach this method, so say "signed in" out loud
+                    }
+
+                    continue;
                 }
 
                 $parts[] = $this->term($term, $nullableUser, $modelVariable, $ownerColumn, $rule->source);
@@ -66,6 +81,18 @@ final class RuleRenderer
         return strlen($line) + $indent > 100
             ? implode(" ||\n" . str_repeat(' ', 12), $expressions)
             : $line;
+    }
+
+    /** @param  array<int, Term>  $group */
+    private function impliesUser(array $group): bool
+    {
+        foreach ($group as $term) {
+            if (! $term->negated && in_array($term->name, self::USER_TERMS, true)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function term(Term $term, bool $nullable, ?string $model, ?string $ownerColumn, string $source): string

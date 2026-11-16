@@ -7,13 +7,15 @@ namespace Dakotajune\BlueprintPolicies\Lexers;
 use Blueprint\Contracts\Lexer;
 use Dakotajune\BlueprintPolicies\Models\PolicyDefinition;
 use Dakotajune\BlueprintPolicies\Rules\Rule;
+use Dakotajune\BlueprintPolicies\Support\TargetConfig;
 use InvalidArgumentException;
 
 /**
- * Reads and validates the `policies:` section of the draft. Registry key: `blueprint_policies`
- * (never `policies`, which Blueprint's own `meta: policies:` support owns).
+ * Reads and validates the `policies:` and `nova_policies:` sections of the draft. Registry keys:
+ * `blueprint_policies` and `blueprint_nova_policies` (never `policies`, which Blueprint's own
+ * `meta: policies:` support owns).
  *
- *     policies:
+ *     policies:                       # App\Policies, wired into controllers
  *       Post:
  *         owner: author_id
  *         before: admin
@@ -24,20 +26,50 @@ use InvalidArgumentException;
  *       Comment:                 # defaults
  *       Tag: false               # opt out (with auto_policies)
  *
+ *     nova_policies:                  # App\Nova\Policies, registered on the Nova resource
+ *       Post:
+ *         resource: Post         # when the Nova resource is not named like the policy
+ *         abilities: ...
+ *
+ * Both sections take the same options, except `controller` (policies only) and `resource` (nova_policies only).
  * Shorthand: `policies: [Post, Comment]` or `policies: Post, Comment`.
  */
 final class PolicyLexer implements Lexer
 {
     public const REGISTRY_KEY = 'blueprint_policies';
 
-    private const OPTIONS = ['model', 'owner', 'before', 'abilities', 'except', 'controller'];
+    public const NOVA_REGISTRY_KEY = 'blueprint_nova_policies';
+
+    public const SECTION = 'policies';
+
+    public const NOVA_SECTION = 'nova_policies';
+
+    private const OPTIONS = ['model', 'owner', 'before', 'abilities', 'except'];
+
+    private const LARAVEL_OPTIONS = ['controller'];
+
+    private const NOVA_OPTIONS = ['resource'];
 
     private const RESERVED_ABILITIES = ['before', 'after'];
 
-    /** @return array{blueprint_policies: array<string, PolicyDefinition>} */
+    /** The target of the section being read; set by section(). */
+    private string $target = TargetConfig::LARAVEL;
+
+    /** @return array{blueprint_policies: array<string, PolicyDefinition>, blueprint_nova_policies: array<string, PolicyDefinition>} */
     public function analyze(array $tokens): array
     {
-        $entries = $this->entries($tokens);
+        return [
+            self::REGISTRY_KEY => $this->section($tokens, self::SECTION, TargetConfig::LARAVEL),
+            self::NOVA_REGISTRY_KEY => $this->section($tokens, self::NOVA_SECTION, TargetConfig::NOVA),
+        ];
+    }
+
+    /** @return array<string, PolicyDefinition> */
+    private function section(array $tokens, string $section, string $target): array
+    {
+        $this->target = $target;
+
+        $entries = $this->entries($tokens, $section);
         $policies = [];
 
         foreach ($entries as $key => $definition) {
@@ -49,29 +81,29 @@ final class PolicyLexer implements Lexer
             $fqcn = $policy->fullyQualifiedClassName();
 
             if (isset($policies[$fqcn])) {
-                throw new InvalidArgumentException("Policy [{$policy->className()}] is defined more than once in the draft.");
+                throw new InvalidArgumentException("{$this->subject($policy->className())} is defined more than once in the draft.");
             }
 
             $policies[$fqcn] = $policy;
         }
 
-        return [self::REGISTRY_KEY => $policies];
+        return $policies;
     }
 
     /** @return array<string, mixed> */
-    private function entries(array $tokens): array
+    private function entries(array $tokens, string $sectionName): array
     {
-        $section = $tokens['policies'] ?? null;
+        $section = $tokens[$sectionName] ?? null;
         $entries = [];
 
         if (is_string($section)) {
-            $section = $this->names($section, 'policies');
+            $section = $this->names($section, $sectionName);
         }
 
         if (is_array($section)) {
             foreach ($section as $key => $value) {
                 if (is_int($key)) {
-                    $entries[$this->name($value, 'policies')] = null;     // a list of model names
+                    $entries[$this->name($value, $sectionName)] = null;     // a list of model names
 
                     continue;
                 }
@@ -79,10 +111,10 @@ final class PolicyLexer implements Lexer
                 $entries[$key] = $value;
             }
         } elseif ($section !== null) {
-            throw new InvalidArgumentException('`policies:` must be a map of models, or a list of model names.');
+            throw new InvalidArgumentException("`{$sectionName}:` must be a map of models, or a list of model names.");
         }
 
-        if ((bool) config('blueprint_policies.auto_policies', false)) {
+        if ((bool) TargetConfig::get($this->target, 'auto_policies', false)) {
             $declared = array_map($this->normalise(...), array_keys($entries));
 
             foreach ($tokens['models'] ?? [] as $model => $definition) {
@@ -106,13 +138,15 @@ final class PolicyLexer implements Lexer
         }
 
         if (! is_array($definition)) {
-            throw new InvalidArgumentException("Policy [{$key}] must be a map of options, empty, or `false`.");
+            throw new InvalidArgumentException("{$this->subject($key)} must be a map of options, empty, or `false`.");
         }
 
+        $options = [...self::OPTIONS, ...($this->target === TargetConfig::NOVA ? self::NOVA_OPTIONS : self::LARAVEL_OPTIONS)];
+
         foreach (array_keys($definition) as $option) {
-            if (! in_array($option, self::OPTIONS, true)) {
+            if (! in_array($option, $options, true)) {
                 throw new InvalidArgumentException(
-                    "Policy [{$key}] has an unknown option [{$option}]. Valid options: " . implode(', ', self::OPTIONS) . '.',
+                    "{$this->subject($key)} has an unknown option [{$option}]. Valid options: " . implode(', ', $options) . '.',
                 );
             }
         }
@@ -131,7 +165,7 @@ final class PolicyLexer implements Lexer
         $except = array_key_exists('except', $definition) ? $this->abilityNames($definition['except'], $key, 'except') : [];
 
         if ($abilities !== null && $except !== []) {
-            throw new InvalidArgumentException("Policy [{$key}]: `except` removes abilities from the defaults, so it cannot be combined with `abilities`.");
+            throw new InvalidArgumentException("{$this->subject($key)}: `except` removes abilities from the defaults, so it cannot be combined with `abilities`.");
         }
 
         return new PolicyDefinition(
@@ -142,7 +176,9 @@ final class PolicyLexer implements Lexer
             except: $except,
             owner: $this->owner($definition, $key),
             before: $this->before($definition, $key),
-            controller: $this->controller($definition, $key),
+            controller: $this->target === TargetConfig::NOVA ? null : $this->controller($definition, $key),
+            target: $this->target,
+            resource: $this->target === TargetConfig::NOVA ? $this->resource($definition, $key) : null,
         );
     }
 
@@ -150,7 +186,7 @@ final class PolicyLexer implements Lexer
     private function abilities(mixed $value, string $key): array
     {
         if ($value === null || $value === [] || $value === '') {
-            throw new InvalidArgumentException("Policy [{$key}]: `abilities` is empty. Leave it out for the defaults, or list at least one ability.");
+            throw new InvalidArgumentException("{$this->subject($key)}: `abilities` is empty. Leave it out for the defaults, or list at least one ability.");
         }
 
         if (is_string($value)) {
@@ -158,7 +194,7 @@ final class PolicyLexer implements Lexer
         }
 
         if (! is_array($value)) {
-            throw new InvalidArgumentException("Policy [{$key}]: `abilities` must be a map (ability: rule) or a list of ability names.");
+            throw new InvalidArgumentException("{$this->subject($key)}: `abilities` must be a map (ability: rule) or a list of ability names.");
         }
 
         $abilities = [];
@@ -191,7 +227,7 @@ final class PolicyLexer implements Lexer
         if (is_array($spec)) {
             foreach (array_keys($spec) as $option) {
                 if (! in_array($option, ['rule', 'scope'], true)) {
-                    throw new InvalidArgumentException("Policy [{$key}], ability [{$name}]: unknown option [{$option}]. Valid options: rule, scope.");
+                    throw new InvalidArgumentException("{$this->subject($key)}, ability [{$name}]: unknown option [{$option}]. Valid options: rule, scope.");
                 }
             }
 
@@ -201,7 +237,7 @@ final class PolicyLexer implements Lexer
                 $scope = $this->string($spec['scope'], $key, "abilities.{$name}.scope");
 
                 if (! in_array($scope, [PolicyDefinition::CLASS_SCOPE, PolicyDefinition::INSTANCE_SCOPE], true)) {
-                    throw new InvalidArgumentException("Policy [{$key}], ability [{$name}]: scope must be `class` or `instance`, not [{$scope}].");
+                    throw new InvalidArgumentException("{$this->subject($key)}, ability [{$name}]: scope must be `class` or `instance`, not [{$scope}].");
                 }
             }
         } elseif ($spec !== null) {
@@ -213,7 +249,7 @@ final class PolicyLexer implements Lexer
 
             if ($scope === PolicyDefinition::CLASS_SCOPE && $parsed->needsModel()) {
                 throw new InvalidArgumentException(
-                    "Policy [{$key}], ability [{$name}]: rule [{$rule}] looks at a record (owner / state), but `{$name}` acts on the class, not a record.",
+                    "{$this->subject($key)}, ability [{$name}]: rule [{$rule}] looks at a record (owner / state), but `{$name}` acts on the class, not a record.",
                 );
             }
         }
@@ -227,7 +263,7 @@ final class PolicyLexer implements Lexer
         $names = is_string($value) ? $this->names($value, "{$key}.{$option}") : $value;
 
         if (! is_array($names)) {
-            throw new InvalidArgumentException("Policy [{$key}]: `{$option}` must be a list of ability names.");
+            throw new InvalidArgumentException("{$this->subject($key)}: `{$option}` must be a list of ability names.");
         }
 
         $result = [];
@@ -244,11 +280,11 @@ final class PolicyLexer implements Lexer
     private function assertAbilityName(string $name, string $key): void
     {
         if (! preg_match('/^[a-z][A-Za-z0-9]*$/', $name)) {
-            throw new InvalidArgumentException("Policy [{$key}]: [{$name}] is not a valid ability name. Use camelCase, e.g. `update` or `publishDraft`.");
+            throw new InvalidArgumentException("{$this->subject($key)}: [{$name}] is not a valid ability name. Use camelCase, e.g. `update` or `publishDraft`.");
         }
 
         if (in_array($name, self::RESERVED_ABILITIES, true)) {
-            throw new InvalidArgumentException("Policy [{$key}]: [{$name}] is a policy hook, not an ability. Use the `before:` option for before().");
+            throw new InvalidArgumentException("{$this->subject($key)}: [{$name}] is a policy hook, not an ability. Use the `before:` option for before().");
         }
     }
 
@@ -265,23 +301,28 @@ final class PolicyLexer implements Lexer
         $column = $this->string($definition['owner'], $key, 'owner');
 
         if (! preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $column)) {
-            throw new InvalidArgumentException("Policy [{$key}]: owner [{$column}] is not a column name.");
+            throw new InvalidArgumentException("{$this->subject($key)}: owner [{$column}] is not a column name.");
         }
 
         return $column;
     }
 
-    private function before(array $definition, string $key): ?string
+    /** Absent = the configured global rule (if any); `false` = this policy has no before() at all. */
+    private function before(array $definition, string $key): string|false|null
     {
-        if (! isset($definition['before']) || $definition['before'] === false) {
+        if (! array_key_exists('before', $definition) || $definition['before'] === null) {
             return null;
+        }
+
+        if ($definition['before'] === false) {
+            return false;
         }
 
         $text = $this->string($definition['before'], $key, 'before');
         $rule = $this->rule($text, $key, 'before');
 
         if ($rule->needsModel()) {
-            throw new InvalidArgumentException("Policy [{$key}]: `before` runs before any record is known, so it cannot use owner or state.");
+            throw new InvalidArgumentException("{$this->subject($key)}: `before` runs before any record is known, so it cannot use owner or state.");
         }
 
         return $text;
@@ -296,19 +337,36 @@ final class PolicyLexer implements Lexer
         return $definition['controller'] === false ? false : $this->normalise($this->string($definition['controller'], $key, 'controller'));
     }
 
+    private function resource(array $definition, string $key): ?string
+    {
+        if (! array_key_exists('resource', $definition) || $definition['resource'] === null) {
+            return null;
+        }
+
+        $name = $this->normalise($this->string($definition['resource'], $key, 'resource'));
+
+        foreach (explode('\\', $name) as $segment) {
+            if (! preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $segment)) {
+                throw new InvalidArgumentException("{$this->subject($key)}: resource [{$name}] is not a class name.");
+            }
+        }
+
+        return $name;
+    }
+
     private function rule(string $text, string $key, string $where): Rule
     {
         try {
             return Rule::parse($text);
         } catch (InvalidArgumentException $e) {
-            throw new InvalidArgumentException("Policy [{$key}], {$where}: " . $e->getMessage(), 0, $e);
+            throw new InvalidArgumentException("{$this->subject($key)}, {$where}: " . $e->getMessage(), 0, $e);
         }
     }
 
     private function string(mixed $value, string $key, string $option): string
     {
         if (is_bool($value) || (! is_string($value) && ! is_int($value)) || trim((string) $value) === '') {
-            throw new InvalidArgumentException("Policy [{$key}]: `{$option}` must be a non-empty string.");
+            throw new InvalidArgumentException("{$this->subject($key)}: `{$option}` must be a non-empty string.");
         }
 
         return trim((string) $value);
@@ -349,5 +407,11 @@ final class PolicyLexer implements Lexer
         array_pop($parts);
 
         return implode('\\', $parts);
+    }
+
+    /** "Policy [Post]" or "Nova policy [Post]", so a message says which section it is about. */
+    private function subject(string $key): string
+    {
+        return ($this->target === TargetConfig::NOVA ? 'Nova policy' : 'Policy') . " [{$key}]";
     }
 }

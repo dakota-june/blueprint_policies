@@ -12,6 +12,120 @@ use RuntimeException;
  */
 trait ReadsTokens
 {
+    /**
+     * Every editor works on LF text. A file that uses CRLF (usual on Windows checkouts) is converted on the way in
+     * and converted back on the way out, so an edit never mixes line endings and never trips over a "\r".
+     *
+     * A file that mixes endings (Blueprint on Windows writes some lines as CRLF, some as LF, some as a doubled-CR "\r\r\n") is
+     * restored line by line: lines the edit did not touch keep the ending they had, so removing what we added gives
+     * the original bytes back; new lines get whichever ending the file uses more.
+     *
+     * @return array{0: string, 1: string|array<string, mixed>}  the source with LF endings, and what to restore
+     */
+    private function toLf(string $source): array
+    {
+        if (! str_contains($source, "\n")) {
+            return [$source, "\n"];
+        }
+
+        // A line ends at "\n" plus any carriage returns before it: Blueprint on Windows can write "\r\r\n".
+        $parts = preg_split('/(\r*\n)/', $source, -1, PREG_SPLIT_DELIM_CAPTURE);
+        $lines = [];
+        $ends = [];
+        $counts = [];
+
+        for ($i = 0, $n = count($parts); $i < $n; $i += 2) {
+            $lines[] = $parts[$i];
+            $ends[] = $parts[$i + 1] ?? '';
+
+            if (isset($parts[$i + 1])) {
+                $counts[$parts[$i + 1]] = ($counts[$parts[$i + 1]] ?? 0) + 1;
+            }
+        }
+
+        $lf = preg_replace('/\r*\n/', "\n", $source);
+
+        if (count($counts) === 1) {
+            return [$lf, (string) array_key_first($counts)];
+        }
+
+        arsort($counts);
+
+        return [$lf, ['lines' => $lines, 'ends' => $ends, 'dominant' => (string) array_key_first($counts)]];
+    }
+
+    /** @param  string|array<string, mixed>  $eol  what toLf() returned */
+    private function fromLf(string $source, string|array $eol): string
+    {
+        if (is_string($eol)) {
+            return $eol === "\n" ? $source : str_replace("\n", $eol, $source);
+        }
+
+        $old = $eol['lines'];
+        $ends = $eol['ends'];
+        $new = explode("\n", $source);
+        $oldCount = count($old);
+        $newCount = count($new);
+
+        // $map[newIndex] = index of the same, untouched line in the original (or null for a new line).
+        $map = array_fill(0, $newCount, null);
+        $head = 0;
+
+        while ($head < $oldCount && $head < $newCount && $old[$head] === $new[$head]) {
+            $map[$head] = $head;
+            $head++;
+        }
+
+        $oldTail = $oldCount - 1;
+        $newTail = $newCount - 1;
+
+        while ($oldTail >= $head && $newTail >= $head && $old[$oldTail] === $new[$newTail]) {
+            $map[$newTail--] = $oldTail--;
+        }
+
+        $oldMid = $oldTail - $head + 1;
+        $newMid = $newTail - $head + 1;
+
+        if ($oldMid > 0 && $newMid > 0 && $oldMid * $newMid <= 4_000_000) {
+            $table = array_fill(0, $oldMid + 1, array_fill(0, $newMid + 1, 0));
+
+            for ($i = $oldMid - 1; $i >= 0; $i--) {
+                for ($j = $newMid - 1; $j >= 0; $j--) {
+                    $table[$i][$j] = $old[$head + $i] === $new[$head + $j]
+                        ? $table[$i + 1][$j + 1] + 1
+                        : max($table[$i + 1][$j], $table[$i][$j + 1]);
+                }
+            }
+
+            for ($i = 0, $j = 0; $i < $oldMid && $j < $newMid;) {
+                if ($old[$head + $i] === $new[$head + $j]) {
+                    $map[$head + $j] = $head + $i;
+                    $i++;
+                    $j++;
+                } elseif ($table[$i + 1][$j] >= $table[$i][$j + 1]) {
+                    $i++;
+                } else {
+                    $j++;
+                }
+            }
+        }
+
+        $out = '';
+
+        foreach ($new as $index => $line) {
+            $out .= $line;
+
+            if ($index === $newCount - 1) {
+                break;
+            }
+
+            $from = $map[$index];
+            $out .= $from !== null && $from < $oldCount - 1 ? $ends[$from] : $eol['dominant'];
+        }
+
+        return $out;
+    }
+
     /** @param  array<int, PhpToken>  $tokens */
     private function prevSignificant(array $tokens, int $from): ?int
     {

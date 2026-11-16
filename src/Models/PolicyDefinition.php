@@ -5,9 +5,10 @@ declare(strict_types=1);
 namespace Dakotajune\BlueprintPolicies\Models;
 
 use Blueprint\Contracts\Model as BlueprintModel;
+use Dakotajune\BlueprintPolicies\Support\TargetConfig;
 
 /**
- * Tree representation of one entry in the draft's `policies:` block.
+ * Tree representation of one entry in the draft's `policies:` or `nova_policies:` block.
  *
  * Deliberately not Blueprint's own `Blueprint\Models\Policy` (the one created by `meta: policies:` on a controller):
  * that lives under the `policies` registry key and has its own generator, and the two must not meet.
@@ -27,7 +28,10 @@ final class PolicyDefinition implements BlueprintModel
      * @param  array<string, array{rule: ?string, scope: string}>|null  $abilities  null = the configured defaults
      * @param  array<int, string>  $except  Abilities removed from the defaults
      * @param  string|false|null  $owner  Owner column; null = detect, false = the model has no owner
-     * @param  string|false|null  $controller  Controller to wire; null = detect, false = leave controllers alone
+     * @param  string|false|null  $before  A rule granting everything; null = the configured global one, false = none at all
+     * @param  string|false|null  $controller  Controller to wire; null = detect, false = leave controllers alone (laravel target only)
+     * @param  string  $target  TargetConfig::LARAVEL (`policies:`) or TargetConfig::NOVA (`nova_policies:`)
+     * @param  string|null  $resource  Nova resource the policy is for, e.g. "Post" or "Admin\Post"; null = same path as the policy key (nova target only)
      */
     public function __construct(
         private readonly string $name,
@@ -36,8 +40,10 @@ final class PolicyDefinition implements BlueprintModel
         private readonly ?array $abilities,
         private readonly array $except,
         private readonly string|false|null $owner,
-        private readonly ?string $before,
+        private readonly string|false|null $before,
         private readonly string|false|null $controller,
+        private readonly string $target = TargetConfig::LARAVEL,
+        private readonly ?string $resource = null,
     ) {}
 
     /** The model's short name, e.g. "Post". */
@@ -46,12 +52,27 @@ final class PolicyDefinition implements BlueprintModel
         return $this->name;
     }
 
-    /** Namespace relative to the application root namespace, e.g. "Policies" or "Policies\Blog". */
+    public function target(): string
+    {
+        return $this->target;
+    }
+
+    public function isNova(): bool
+    {
+        return $this->target === TargetConfig::NOVA;
+    }
+
+    /**
+     * Namespace relative to the application root namespace, e.g. "Policies", "Policies\Blog" or "Nova\Policies".
+     * Blueprint's own `blueprint.policy_namespace` only ever applies to the laravel target.
+     */
     public function namespace(): string
     {
-        $base = trim((string) (config('blueprint.policy_namespace') ?: config('blueprint_policies.namespace', 'Policies')), '\\');
+        $base = $this->isNova()
+            ? (string) TargetConfig::get(TargetConfig::NOVA, 'namespace', 'Nova\\Policies')
+            : (string) (config('blueprint.policy_namespace') ?: config('blueprint_policies.namespace', 'Policies'));
 
-        return trim($base . '\\' . $this->subNamespace, '\\');
+        return trim(trim($base, '\\') . '\\' . $this->subNamespace, '\\');
     }
 
     /** e.g. "App\Policies" */
@@ -82,6 +103,20 @@ final class PolicyDefinition implements BlueprintModel
         return $this->modelName;
     }
 
+    /** The Nova resource this policy is for, relative to the resources namespace, e.g. "Post". */
+    public function resourceName(): string
+    {
+        return $this->resource ?? trim($this->subNamespace . '\\' . $this->name, '\\');
+    }
+
+    /** e.g. "App\Nova\Post" */
+    public function resourceFullyQualifiedClassName(): string
+    {
+        $namespace = trim((string) TargetConfig::get(TargetConfig::NOVA, 'resource_namespace', 'Nova'), '\\');
+
+        return trim((string) config('blueprint.namespace', 'App') . '\\' . $namespace . '\\' . $this->resourceName(), '\\');
+    }
+
     /** @return array<string, array{rule: ?string, scope: string}>|null */
     public function abilities(): ?array
     {
@@ -99,7 +134,7 @@ final class PolicyDefinition implements BlueprintModel
         return $this->owner;
     }
 
-    public function before(): ?string
+    public function before(): string|false|null
     {
         return $this->before;
     }

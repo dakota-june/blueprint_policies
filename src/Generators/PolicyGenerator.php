@@ -20,17 +20,27 @@ use Dakotajune\BlueprintPolicies\Support\NoticeBag;
 use Dakotajune\BlueprintPolicies\Support\PolicyAttributeInjector;
 use Dakotajune\BlueprintPolicies\Support\PolicyClassEditor;
 use Dakotajune\BlueprintPolicies\Support\PolicyMemberBuilder;
+use Dakotajune\BlueprintPolicies\Support\ResourcePolicyInjector;
 use Dakotajune\BlueprintPolicies\Support\StatementEditor;
+use Dakotajune\BlueprintPolicies\Support\TargetConfig;
+use Dakotajune\BlueprintPolicies\Support\WiringReverter;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 
 /**
- * Generates policies from the draft's `policies:` block, then wires them up:
+ * Generates policies from the draft's `policies:` and `nova_policies:` blocks, then wires them up.
+ * Both blocks run through the same rules, editor and manifest; only the output differs:
  *
- *  1. one policy class per entry, abilities as tagged methods (yours are never touched);
- *  2. tagged authorize statements at the top of the matching resource-controller actions;
- *  3. registration (#[UsePolicy] or Gate::policy) for models Laravel would not find the policy for.
+ *  `policies:` (target laravel)
+ *    1. one policy class per entry (App\Policies), abilities as tagged methods (yours are never touched);
+ *    2. tagged authorize statements at the top of the matching resource-controller actions;
+ *    3. registration (#[UsePolicy] or Gate::policy) for models Laravel would not find the policy for.
+ *
+ *  `nova_policies:` (target nova)
+ *    1. one policy class per entry (App\Nova\Policies) that receives the Nova resource;
+ *    2. `public static $policy = ...` on the Nova resource, when that file exists;
+ *    no controller wiring.
  */
 final class PolicyGenerator implements Generator
 {
@@ -49,6 +59,9 @@ final class PolicyGenerator implements Generator
         'forceDelete' => ['forceDelete', PolicyDefinition::INSTANCE_SCOPE],
     ];
 
+    /** Nova's relationship methods take more arguments than the one record this generator writes. */
+    private const NOVA_RELATIONSHIP_METHOD = '/^(?:add|attach|attachAny|detach)[A-Z]/';
+
     private readonly NoticeBag $notices;
 
     private readonly ManifestStore $manifests;
@@ -59,9 +72,14 @@ final class PolicyGenerator implements Generator
 
     private readonly PolicyAttributeInjector $attributes;
 
-    private readonly RuleRenderer $renderer;
+    private readonly ResourcePolicyInjector $resources;
+
+    private readonly WiringReverter $reverter;
 
     private readonly PolicyMemberBuilder $members;
+
+    /** Null = build one from the target's `checks` config for every rule (what a real build does). */
+    private readonly ?RuleRenderer $renderer;
 
     // The Generator contract fixes the first parameter; the rest are optional collaborators.
     public function __construct(
@@ -73,32 +91,41 @@ final class PolicyGenerator implements Generator
         ?PolicyAttributeInjector $attributes = null,
         ?RuleRenderer $renderer = null,
         ?PolicyMemberBuilder $members = null,
+        ?ResourcePolicyInjector $resources = null,
+        ?WiringReverter $reverter = null,
     ) {
         $this->notices = $notices ?? new NoticeBag();
         $this->manifests = $manifests ?? new ManifestStore($files);
         $this->editor = $editor ?? new PolicyClassEditor();
         $this->statements = $statements ?? new StatementEditor();
         $this->attributes = $attributes ?? new PolicyAttributeInjector();
-        $this->renderer = $renderer ?? new RuleRenderer((array) config('blueprint_policies.checks', []));
+        $this->renderer = $renderer;
         $this->members = $members ?? new PolicyMemberBuilder();
+        $this->resources = $resources ?? new ResourcePolicyInjector($this->editor);
+        $this->reverter = $reverter ?? new WiringReverter($files, $this->statements, $this->attributes, $this->resources);
     }
 
-    /** @return array{created: array<int,string>, updated: array<int,string>} */
+    /** @return array{created: array<int,array<int,string>>, updated: array<int,array<int,string>>} */
     public function output(Tree $tree): array
     {
         $output = ['created' => [], 'updated' => []];
 
-        /** @var array<string, PolicyDefinition> $definitions */
-        $definitions = $tree->toArray()[PolicyLexer::REGISTRY_KEY] ?? [];
+        $registry = $tree->toArray();
+        $definitions = [
+            ...array_values($registry[PolicyLexer::REGISTRY_KEY] ?? []),
+            ...array_values($registry[PolicyLexer::NOVA_REGISTRY_KEY] ?? []),
+        ];
 
         if ($definitions === []) {
             return $output;
         }
 
-        $this->assertNoNativeClash($tree, $definitions);
+        $this->assertNoNativeClash($registry, $definitions);
+        $this->assertDistinctFiles($definitions);
 
         $previous = $this->manifests->load();
         $next = new Manifest();
+        $active = [];
         $attribute = [];
         $gate = [];
 
@@ -108,28 +135,38 @@ final class PolicyGenerator implements Generator
             $path = $this->relativePath($definition->fullyQualifiedClassName());
             $existed = $this->files->exists(base_path($path));
             $created = ! $existed || ($previous->policy($path)['created'] ?? false);
+            $active[] = $path;
 
             $this->writePolicy($definition, $plan, $path, $existed);
 
-            $output[$created ? 'created' : 'updated'][] = $path;
-            $next->recordPolicy($path, $definition->className(), $created);
+            // Blueprint prints each entry as [label, path] and records the path in `.blueprint` (array_column(..., 1)).
+            $output[$created ? 'created' : 'updated'][] = ['Policy', $path];
+            $next->recordPolicy($path, $definition->className(), $created, $definition->target());
 
-            $this->wireControllers($tree, $definition, $plan, $next);
+            if ($definition->isNova()) {
+                $this->registerWithResource($definition, $path, $next, $output);
+
+                continue;
+            }
+
+            $this->wireControllers($tree, $definition, $plan, $path, $next);
 
             $mode = $this->registrationMode($plan['modelFqcn'], $definition->fullyQualifiedClassName());
 
             if ($mode === 'attribute') {
-                $attribute[] = [$definition, $plan];
+                $attribute[] = [$definition, $plan, $path];
             } elseif ($mode === 'gate') {
-                $gate[] = [$definition, $plan];
+                $gate[] = [$definition, $plan, $path];
             }
         }
 
-        foreach ($attribute as [$definition, $plan]) {
-            $this->registerWithAttribute($definition, $plan, $next, $output);
+        foreach ($attribute as [$definition, $plan, $path]) {
+            $this->registerWithAttribute($definition, $plan, $path, $previous, $next, $output);
         }
 
-        $this->registerWithGate($gate, $previous, $next, $output);
+        $this->registerWithGate($gate, $next, $output);
+
+        $this->reconcile($previous, $next, $active);
 
         $this->manifests->save($next);
 
@@ -149,19 +186,28 @@ final class PolicyGenerator implements Generator
 
     /**
      * @return array{
-     *     modelFqcn: string, model: ?Model, userFqcn: string, ownerColumn: ?string, variable: string,
+     *     modelFqcn: string, model: ?Model, subjectFqcn: string, userFqcn: string, ownerColumn: ?string,
+     *     variable: string, controllerVariable: string, label: string, plural: string,
      *     abilities: array<string, array{scope: string, rule: Rule, source: string, nullable: bool, expression: string}>,
      *     before: ?array{source: string, expression: string}
      * }
      */
     private function plan(Tree $tree, PolicyDefinition $definition): array
     {
+        $target = $definition->target();
         $modelFqcn = $tree->fqcnForContext($definition->modelName());
         $model = $tree->modelForContext($definition->modelName());
         $label = $definition->name();
-        $variable = Str::camel($definition->name());
-        $variable = $variable === 'user' ? 'model' : $variable;
-        $userFqcn = $this->userClass();
+
+        // The controller's parameter is named after the model (`$user`); inside a policy `$user` is the actor, so the
+        // policy parameter is `$model` there. Keep the two names apart: only the policy one is renamed.
+        $controllerVariable = Str::camel($label);
+        $variable = $controllerVariable === 'user' ? 'model' : $controllerVariable;
+        $userFqcn = $this->userClass($target);
+
+        // Laravel policies receive the model. Nova policies receive the Nova resource, which reaches its model through model().
+        $subjectFqcn = $definition->isNova() ? $definition->resourceFullyQualifiedClassName() : $modelFqcn;
+        $subject = '$' . $variable . ($definition->isNova() ? '->model()' : '');
 
         if ($model === null) {
             $this->notices->add(
@@ -171,14 +217,16 @@ final class PolicyGenerator implements Generator
         }
 
         $ownerColumn = $this->ownerColumn($definition, $model, $userFqcn);
-        $abilities = $this->abilities($definition, $model, $ownerColumn, $variable);
+        $abilities = $this->abilities($definition, $model, $ownerColumn, $subject);
 
         return [
             'modelFqcn' => $modelFqcn,
             'model' => $model,
+            'subjectFqcn' => $subjectFqcn,
             'userFqcn' => $userFqcn,
             'ownerColumn' => $ownerColumn,
             'variable' => $variable,
+            'controllerVariable' => $controllerVariable,
             'abilities' => $abilities,
             'before' => $this->before($definition),
             'label' => strtolower(Str::headline($label)),
@@ -206,7 +254,7 @@ final class PolicyGenerator implements Generator
             return null;
         }
 
-        $candidates = [...(array) config('blueprint_policies.owner_columns', []), Str::snake(Str::afterLast($userFqcn, '\\')) . '_id'];
+        $candidates = [...(array) TargetConfig::get($definition->target(), 'owner_columns', []), Str::snake(Str::afterLast($userFqcn, '\\')) . '_id'];
 
         foreach ($candidates as $candidate) {
             if ($model->hasColumn($candidate)) {
@@ -217,17 +265,21 @@ final class PolicyGenerator implements Generator
         return null;
     }
 
-    /** @return array<string, array{scope: string, rule: Rule, source: string, nullable: bool, expression: string}> */
-    private function abilities(PolicyDefinition $definition, ?Model $model, ?string $ownerColumn, string $variable): array
+    /**
+     * @param  string  $subject  how a rule reaches the record: "$post", or "$post->model()" for a Nova resource
+     * @return array<string, array{scope: string, rule: Rule, source: string, nullable: bool, expression: string}>
+     */
+    private function abilities(PolicyDefinition $definition, ?Model $model, ?string $ownerColumn, string $subject): array
     {
         $class = $definition->className();
+        $target = $definition->target();
         $listed = $definition->abilities();
 
         if ($listed === null) {
-            $names = (array) config('blueprint_policies.default_abilities', ['viewAny', 'view', 'create', 'update', 'delete']);
+            $names = (array) TargetConfig::get($target, 'default_abilities', ['viewAny', 'view', 'create', 'update', 'delete']);
 
             if ($model?->usesSoftDeletes()) {
-                $names = [...$names, ...(array) config('blueprint_policies.soft_delete_abilities', ['restore', 'forceDelete'])];
+                $names = [...$names, ...(array) TargetConfig::get($target, 'soft_delete_abilities', ['restore', 'forceDelete'])];
             }
 
             $listed = [];
@@ -240,14 +292,21 @@ final class PolicyGenerator implements Generator
             }
         }
 
-        $defaults = (array) config('blueprint_policies.default_rules', []);
-        $fallback = (string) config('blueprint_policies.fallback_rule', 'never');
+        $defaults = (array) TargetConfig::get($target, 'default_rules', []);
+        $fallback = (string) TargetConfig::get($target, 'fallback_rule', 'never');
         $abilities = [];
         $locked = [];
 
         foreach ($listed as $name => $spec) {
             $explicit = $spec['rule'] !== null;
             $text = $spec['rule'] ?? ($defaults[$name] ?? null);
+
+            if ($definition->isNova() && preg_match(self::NOVA_RELATIONSHIP_METHOD, (string) $name)) {
+                $this->notices->add(
+                    "{$class}: [{$name}] looks like one of Nova's relationship methods, which receive the related record as well. "
+                    . 'It was written with only the user and the resource, so check its signature before relying on it.',
+                );
+            }
 
             if ($text === null) {
                 $this->notices->add("{$class}: ability [{$name}] has no rule, so it is locked (`{$fallback}`). Give it one under `abilities:`.");
@@ -263,7 +322,7 @@ final class PolicyGenerator implements Generator
                 if ($explicit) {
                     throw new InvalidArgumentException(
                         "Policy [{$class}], ability [{$name}]: rule [{$text}] uses `owner`, but {$definition->modelName()} has no owner column "
-                        . '(looked for ' . implode(', ', (array) config('blueprint_policies.owner_columns', [])) . '). Set `owner: column` on the policy.',
+                        . '(looked for ' . implode(', ', (array) TargetConfig::get($target, 'owner_columns', [])) . '). Set `owner: column` on the policy.',
                     );
                 }
 
@@ -279,7 +338,7 @@ final class PolicyGenerator implements Generator
                 'rule' => $rule,
                 'source' => $rule->source,
                 'nullable' => $nullable,
-                'expression' => $this->render($rule, $nullable, $spec['scope'] === PolicyDefinition::INSTANCE_SCOPE ? '$' . $variable : null, $ownerColumn, $class, $name),
+                'expression' => $this->render($definition, $rule, $nullable, $spec['scope'] === PolicyDefinition::INSTANCE_SCOPE ? $subject : null, $ownerColumn, $name),
             ];
         }
 
@@ -296,15 +355,30 @@ final class PolicyGenerator implements Generator
     /** @return array{source: string, expression: string}|null */
     private function before(PolicyDefinition $definition): ?array
     {
-        $text = $definition->before() ?? config('blueprint_policies.before');
+        $own = $definition->before();
+
+        if ($own === false) {
+            return null;                                   // `before: false`: this policy opts out of even a global before
+        }
+
+        $text = $own ?? TargetConfig::get($definition->target(), 'before');
 
         if (! is_string($text) || trim($text) === '') {
             return null;
         }
 
-        $rule = $this->parse($text, $definition->className(), 'before');
+        $class = $definition->className();
+        $rule = $this->parse($text, $class, 'before');
 
-        return ['source' => $rule->source, 'expression' => $this->render($rule, true, null, null, $definition->className(), 'before')];
+        if ($rule->needsModel()) {
+            throw new InvalidArgumentException("Policy [{$class}], before: [{$text}] runs before any record is known, so it cannot use owner or state.");
+        }
+
+        if ($rule->allowsGuests()) {
+            throw new InvalidArgumentException("Policy [{$class}], before: [{$text}] uses `public`, which would grant every ability to everyone, guests included.");
+        }
+
+        return ['source' => $rule->source, 'expression' => $this->render($definition, $rule, true, null, null, 'before')];
     }
 
     private function parse(string $text, string $class, string $where): Rule
@@ -316,12 +390,14 @@ final class PolicyGenerator implements Generator
         }
     }
 
-    private function render(Rule $rule, bool $nullable, ?string $modelVariable, ?string $ownerColumn, string $class, string $where): string
+    private function render(PolicyDefinition $definition, Rule $rule, bool $nullable, ?string $subject, ?string $ownerColumn, string $where): string
     {
+        $renderer = $this->renderer ?? new RuleRenderer(TargetConfig::checks($definition->target()));
+
         try {
-            return $this->renderer->render($rule, $nullable, $modelVariable, $ownerColumn);
+            return $renderer->render($rule, $nullable, $subject, $ownerColumn);
         } catch (InvalidArgumentException $e) {
-            throw new InvalidArgumentException("Policy [{$class}], {$where}: " . $e->getMessage(), 0, $e);
+            throw new InvalidArgumentException("Policy [{$definition->className()}], {$where}: " . $e->getMessage(), 0, $e);
         }
     }
 
@@ -360,9 +436,9 @@ final class PolicyGenerator implements Generator
         return false;
     }
 
-    private function userClass(): string
+    private function userClass(string $target): string
     {
-        $configured = config('blueprint_policies.user_model') ?: config('auth.providers.users.model');
+        $configured = TargetConfig::get($target, 'user_model') ?: config('auth.providers.users.model');
 
         if (is_string($configured) && $configured !== '') {
             return ltrim($configured, '\\');
@@ -373,20 +449,44 @@ final class PolicyGenerator implements Generator
         return trim((string) config('blueprint.namespace', 'App') . ($models !== '' ? '\\' . $models : '') . '\\User', '\\');
     }
 
-    /** @param  array<string, PolicyDefinition>  $definitions */
-    private function assertNoNativeClash(Tree $tree, array $definitions): void
+    /**
+     * @param  array<string, mixed>  $registry
+     * @param  array<int, PolicyDefinition>  $definitions
+     */
+    private function assertNoNativeClash(array $registry, array $definitions): void
     {
-        $native = $tree->toArray()['policies'] ?? [];
+        $native = $registry['policies'] ?? [];
 
         foreach ($native as $policy) {
             $fqcn = $policy->fullyQualifiedClassName();
 
-            if (isset($definitions[$fqcn])) {
+            foreach ($definitions as $definition) {
+                if (! $definition->isNova() && $definition->fullyQualifiedClassName() === $fqcn) {
+                    throw new InvalidArgumentException(
+                        "Policy [{$policy->className()}] is declared twice: by `meta: policies` on a controller (Blueprint's own policy support) "
+                        . 'and by the `policies:` section. Keep one; `policies:` can do everything `meta: policies` does.',
+                    );
+                }
+            }
+        }
+    }
+
+    /** `policies:` and `nova_policies:` may name the same model, but never write the same file. */
+    private function assertDistinctFiles(array $definitions): void
+    {
+        $seen = [];
+
+        foreach ($definitions as $definition) {
+            $path = $this->relativePath($definition->fullyQualifiedClassName());
+
+            if (isset($seen[$path]) && $seen[$path]->target() !== $definition->target()) {
                 throw new InvalidArgumentException(
-                    "Policy [{$policy->className()}] is declared twice: by `meta: policies` on a controller (Blueprint's own policy support) "
-                    . 'and by the `policies:` section. Keep one; `policies:` can do everything `meta: policies` does.',
+                    "Policy [{$definition->className()}] is declared in both `policies:` and `nova_policies:`, and both would be written to {$path}. "
+                    . 'Give the Nova policies their own namespace with `nova.namespace` in config/blueprint_policies.php.',
                 );
             }
+
+            $seen[$path] = $definition;
         }
     }
 
@@ -408,7 +508,7 @@ final class PolicyGenerator implements Generator
             $methods[$name] = $this->members->ability(
                 $name,
                 $plan['userFqcn'],
-                $ability['scope'] === PolicyDefinition::INSTANCE_SCOPE ? $plan['modelFqcn'] : null,
+                $ability['scope'] === PolicyDefinition::INSTANCE_SCOPE ? $plan['subjectFqcn'] : null,
                 $plan['variable'],
                 $ability['nullable'],
                 $ability['expression'],
@@ -439,25 +539,25 @@ final class PolicyGenerator implements Generator
         return str_replace(
             ['{{ namespace }}', '{{ class }}'],
             [$definition->fullyQualifiedNamespace(), $definition->className()],
-            $this->files->get($this->stubPath()),
+            $this->files->get($this->stubPath($definition)),
         );
     }
 
-    private function stubPath(): string
+    private function stubPath(PolicyDefinition $definition): string
     {
-        $custom = base_path('stubs/blueprint/blueprint-policy.stub');
+        $custom = base_path('stubs/blueprint/' . ($definition->isNova() ? 'blueprint-nova-policy.stub' : 'blueprint-policy.stub'));
 
         return $this->files->exists($custom) ? $custom : dirname(__DIR__, 2) . '/stubs/policy.stub';
     }
 
     // =====================================================================================================
-    // Controllers
+    // Controllers (policies: only)
     // =====================================================================================================
 
     /** @param  array<string, mixed>  $plan */
-    private function wireControllers(Tree $tree, PolicyDefinition $definition, array $plan, Manifest $manifest): void
+    private function wireControllers(Tree $tree, PolicyDefinition $definition, array $plan, string $policyPath, Manifest $manifest): void
     {
-        if (! (bool) config('blueprint_policies.controllers.wire', true) || $definition->controller() === false) {
+        if (! (bool) TargetConfig::get(TargetConfig::LARAVEL, 'controllers.wire', true) || $definition->controller() === false) {
             return;
         }
 
@@ -481,7 +581,7 @@ final class PolicyGenerator implements Generator
             return;
         }
 
-        $style = (string) config('blueprint_policies.controllers.style', 'gate');
+        $style = (string) TargetConfig::get(TargetConfig::LARAVEL, 'controllers.style', 'gate');
         $class = $controller->className();
         $source = $this->statements->strip($this->files->get(base_path($path)));
         $uses = [];
@@ -500,8 +600,8 @@ final class PolicyGenerator implements Generator
                 $uses[] = $plan['modelFqcn'];
                 $required = null;
             } else {
-                $statement = $this->call($style, $ability, '$' . $plan['variable']);
-                $required = $plan['variable'];
+                $statement = $this->call($style, $ability, '$' . $plan['controllerVariable']);
+                $required = $plan['controllerVariable'];
             }
 
             if ($style === 'gate') {
@@ -523,7 +623,7 @@ final class PolicyGenerator implements Generator
         }
 
         if ($this->statements->hasTagged($source)) {
-            $manifest->recordController($path, $class, $uses);
+            $manifest->recordController($path, $class, $uses, $policyPath);
         }
     }
 
@@ -592,7 +692,7 @@ final class PolicyGenerator implements Generator
     /** @return 'attribute'|'gate'|null */
     private function registrationMode(string $modelFqcn, string $policyFqcn): ?string
     {
-        $configured = (string) config('blueprint_policies.registration', 'auto');
+        $configured = (string) TargetConfig::get(TargetConfig::LARAVEL, 'registration', 'auto');
 
         if ($configured === 'none' || $this->discoverable($modelFqcn, $policyFqcn)) {
             return null;
@@ -624,10 +724,60 @@ final class PolicyGenerator implements Generator
     }
 
     /**
-     * @param  array<string, mixed>  $plan
-     * @param  array{created: array<int,string>, updated: array<int,string>}  $output
+     * Nova reads `public static $policy` from the resource, so that is where a Nova policy is registered.
+     * It never touches the model or the Gate, which is what keeps the Nova policy independent of the web one.
+     *
+     * @param  array{created: array<int,mixed>, updated: array<int,mixed>}  $output
      */
-    private function registerWithAttribute(PolicyDefinition $definition, array $plan, Manifest $next, array &$output): void
+    private function registerWithResource(PolicyDefinition $definition, string $policyPath, Manifest $next, array &$output): void
+    {
+        if ((string) TargetConfig::get(TargetConfig::NOVA, 'registration', 'resource') === 'none') {
+            return;
+        }
+
+        $fqcn = $definition->resourceFullyQualifiedClassName();
+        $path = $this->relativePath($fqcn);
+        $short = Str::afterLast($fqcn, '\\');
+
+        if (! $this->files->exists(base_path($path))) {
+            $this->notices->add(
+                "{$definition->className()} was not registered: the Nova resource {$path} does not exist. "
+                . "Create it (php artisan nova:resource {$short}) and build again, name it with `resource:`, or set `public static \$policy` yourself.",
+            );
+
+            return;
+        }
+
+        $source = $this->files->get(base_path($path));
+        $result = $this->resources->inject($source, $short, $definition->fullyQualifiedClassName());
+
+        if ($result->status === InjectionResult::CONFLICT) {
+            $this->notices->add("{$fqcn} already sets a different `\$policy`, so {$definition->className()} was not registered. That choice is yours.");
+
+            return;
+        }
+
+        if ($result->status === InjectionResult::CLASS_NOT_FOUND) {
+            $this->notices->add("{$definition->className()} was not registered: class {$fqcn} was not found in {$path}.");
+
+            return;
+        }
+
+        if ($result->source !== $source) {
+            $this->files->put(base_path($path), $result->source);
+            $output['updated'][] = ['Resource', $path];
+        }
+
+        if ($result->uses !== []) {                         // empty when the `$policy` is the developer's own line
+            $next->recordResource($path, $short, $definition->fullyQualifiedClassName(), $result->uses, $policyPath);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $plan
+     * @param  array{created: array<int,mixed>, updated: array<int,mixed>}  $output
+     */
+    private function registerWithAttribute(PolicyDefinition $definition, array $plan, string $policyPath, Manifest $previous, Manifest $next, array &$output): void
     {
         $path = $this->relativePath($plan['modelFqcn']);
 
@@ -654,51 +804,47 @@ final class PolicyGenerator implements Generator
 
         if ($result->source !== $source) {
             $this->files->put(base_path($path), $result->source);
-            $output['updated'][] = $path;
+            $output['updated'][] = ['Model', $path];
         }
 
-        $next->recordModel($path, Str::afterLast($plan['modelFqcn'], '\\'), $definition->fullyQualifiedClassName(), [
-            PolicyAttributeInjector::ATTRIBUTE_FQCN,
-            $definition->fullyQualifiedClassName(),
-        ]);
+        // An attribute that was already there is the developer's own unless an earlier build put it there:
+        // only then is it ours to remove again on erase.
+        if ($result->status === InjectionResult::INSERTED || $previous->model($path) !== null) {
+            $next->recordModel($path, Str::afterLast($plan['modelFqcn'], '\\'), $definition->fullyQualifiedClassName(), [
+                PolicyAttributeInjector::ATTRIBUTE_FQCN,
+                $definition->fullyQualifiedClassName(),
+            ], $policyPath);
+        }
     }
 
     /**
-     * @param  array<int, array{0: PolicyDefinition, 1: array<string, mixed>}>  $entries
-     * @param  array{created: array<int,string>, updated: array<int,string>}  $output
+     * @param  array<int, array{0: PolicyDefinition, 1: array<string, mixed>, 2: string}>  $entries
+     * @param  array{created: array<int,mixed>, updated: array<int,mixed>}  $output
      */
-    private function registerWithGate(array $entries, Manifest $previous, Manifest $next, array &$output): void
+    private function registerWithGate(array $entries, Manifest $next, array &$output): void
     {
-        $path = (string) config('blueprint_policies.provider', 'app/Providers/AppServiceProvider.php');
-        $absolute = base_path($path);
-
         if ($entries === []) {
-            // Nothing to register any more: take back lines an earlier build put in the provider.
-            foreach ($previous->providers() as $recorded => $meta) {
-                if ($this->files->exists(base_path($recorded))) {
-                    $source = $this->files->get(base_path($recorded));
-                    $stripped = $this->statements->strip($source, $meta['uses']);
-
-                    if ($stripped !== $source) {
-                        $this->files->put(base_path($recorded), $stripped);
-                    }
-                }
-            }
-
-            return;
+            return;                                         // lines an earlier build put in a provider are taken back by reconcile()
         }
+
+        $path = (string) TargetConfig::get(TargetConfig::LARAVEL, 'provider', 'app/Providers/AppServiceProvider.php');
+        $absolute = base_path($path);
 
         $lines = [];
         $uses = [self::GATE];
+        $owners = [];
 
-        foreach ($entries as [$definition, $plan]) {
+        foreach ($entries as [$definition, $plan, $policyPath]) {
             $lines[] = '{{ use:' . self::GATE . ' }}::policy({{ use:' . $plan['modelFqcn'] . ' }}::class, {{ use:' . $definition->fullyQualifiedClassName() . ' }}::class);';
             $uses[] = $plan['modelFqcn'];
             $uses[] = $definition->fullyQualifiedClassName();
+            $owners[] = $policyPath;
         }
 
+        $manual = array_map(static fn (array $e): array => [$e[0], $e[1]], $entries);
+
         if (! $this->files->exists($absolute)) {
-            $this->notices->add($this->manualRegistration($path, 'the provider file does not exist', $entries));
+            $this->notices->add($this->manualRegistration($path, 'the provider file does not exist', $manual));
 
             return;
         }
@@ -708,17 +854,17 @@ final class PolicyGenerator implements Generator
         $result = $this->statements->insert($this->statements->strip($source), $class, 'boot', $lines);
 
         if ($result->notices !== []) {
-            $this->notices->add($this->manualRegistration($path, "{$class}::boot() could not be edited", $entries));
+            $this->notices->add($this->manualRegistration($path, "{$class}::boot() could not be edited", $manual));
 
             return;
         }
 
         if ($result->source !== $source) {
             $this->files->put($absolute, $result->source);
-            $output['updated'][] = $path;
+            $output['updated'][] = ['Provider', $path];
         }
 
-        $next->recordProvider($path, $class, $uses);
+        $next->recordProvider($path, $class, $uses, $owners);
     }
 
     /** @param  array<int, array{0: PolicyDefinition, 1: array<string, mixed>}>  $entries */
@@ -730,6 +876,65 @@ final class PolicyGenerator implements Generator
         );
 
         return "Policies were not registered ({$why}). Add to {$path} boot(): " . implode(' ', $lines);
+    }
+
+    // =====================================================================================================
+    // Keeping the manifest honest
+    // =====================================================================================================
+
+    /**
+     * Compares what the last build changed with what this one did.
+     *
+     *  - An edit a policy of this draft no longer asks for (`controller: false`, another registration mode, a moved
+     *    controller or resource ...) is undone, so the file does not keep a line that nothing manages any more.
+     *  - A policy that is not in this draft at all (a second draft file, say) keeps its record and its edits,
+     *    so `blueprint:erase` can still put them back.
+     *
+     * @param  array<int, string>  $active  paths of the policy files this build wrote
+     */
+    private function reconcile(Manifest $previous, Manifest $next, array $active): void
+    {
+        foreach ($previous->policies() as $path => $meta) {
+            if (! in_array($path, $active, true)) {
+                $next->adopt(Manifest::POLICIES, $path, $meta);
+            }
+        }
+
+        $undo = [
+            Manifest::CONTROLLERS => $this->reverter->controller(...),
+            Manifest::MODELS => $this->reverter->model(...),
+            Manifest::RESOURCES => $this->reverter->resource(...),
+        ];
+
+        foreach ($undo as $section => $revert) {
+            foreach ($previous->section($section) as $path => $meta) {
+                if ($next->has($section, $path)) {
+                    continue;
+                }
+
+                if (in_array($meta['owner'] ?? null, $active, true)) {
+                    $revert($path, $meta);
+
+                    continue;
+                }
+
+                $next->adopt($section, $path, $meta);
+            }
+        }
+
+        foreach ($previous->providers() as $path => $meta) {
+            if ($next->has(Manifest::PROVIDERS, $path)) {
+                continue;
+            }
+
+            if (array_intersect((array) ($meta['owners'] ?? []), $active) !== []) {
+                $this->reverter->provider($path, $meta);
+
+                continue;
+            }
+
+            $next->adopt(Manifest::PROVIDERS, $path, $meta);
+        }
     }
 
     /** Path relative to the project root, built with Blueprint's own helpers. */

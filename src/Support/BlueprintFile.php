@@ -25,6 +25,7 @@ final class BlueprintFile
     /**
      * Removes the given paths from the `created` list so erase will not delete them.
      * A copy of the original is written next to it first; nothing is changed if the backup cannot be made.
+     * Paths are compared with forward slashes, so a `.blueprint` written on Windows matches too.
      *
      * @param  array<int, string>  $paths
      * @return string|null  The backup path when the file was modified, otherwise null.
@@ -44,9 +45,11 @@ final class BlueprintFile
             return null;
         }
 
+        $paths = array_map($this->normalise(...), $paths);
+
         $remaining = array_values(array_filter(
             $created,
-            fn (mixed $entry): bool => ! in_array($this->pathOf($entry), $paths, true),
+            fn (mixed $entry): bool => ! in_array($this->normalise($this->pathOf($entry)), $paths, true),
         ));
 
         if (count($remaining) === count($created)) {
@@ -76,6 +79,11 @@ final class BlueprintFile
         }
 
         return is_string($entry) ? $entry : '';
+    }
+
+    private function normalise(string $path): string
+    {
+        return str_replace('\\', '/', $path);
     }
 
     private function backupPath(): string

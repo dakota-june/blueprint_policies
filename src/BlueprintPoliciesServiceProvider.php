@@ -20,9 +20,12 @@ use Illuminate\Support\ServiceProvider;
  */
 final class BlueprintPoliciesServiceProvider extends ServiceProvider
 {
+    /** Config keys that hold a map of settings, so a published file that sets one entry keeps the defaults of the rest. */
+    private const MAPS = ['checks', 'controllers'];
+
     public function register(): void
     {
-        $this->mergeConfigFrom(__DIR__ . '/../config/blueprint_policies.php', 'blueprint_policies');
+        $this->mergeConfig();
 
         $this->app->singleton(NoticeBag::class);
 
@@ -64,6 +67,60 @@ final class BlueprintPoliciesServiceProvider extends ServiceProvider
             $this->publishes([
                 __DIR__ . '/../stubs/policy.stub' => base_path('stubs/blueprint/blueprint-policy.stub'),
             ], 'blueprint-policies-stubs');
+
+            $this->publishes([
+                __DIR__ . '/../stubs/policy.stub' => base_path('stubs/blueprint/blueprint-nova-policy.stub'),
+            ], 'blueprint-policies-nova-stubs');
         }
+    }
+
+    /**
+     * Like mergeConfigFrom(), but one level deeper for the settings maps and the `nova` block. Laravel's own merge is
+     * shallow, so a published config that overrode just `checks.role` would silently drop `admin` and `verified`.
+     */
+    private function mergeConfig(): void
+    {
+        if (method_exists($this->app, 'configurationIsCached') && $this->app->configurationIsCached()) {
+            return;
+        }
+
+        $defaults = require __DIR__ . '/../config/blueprint_policies.php';
+        $config = $this->app['config'];
+
+        $config->set('blueprint_policies', $this->merge($defaults, (array) $config->get('blueprint_policies', [])));
+    }
+
+    /**
+     * @param  array<string, mixed>  $defaults
+     * @param  array<string, mixed>  $current
+     * @return array<string, mixed>
+     */
+    private function merge(array $defaults, array $current): array
+    {
+        $merged = $this->mergeMaps($defaults, $current);
+
+        if (is_array($defaults['nova'] ?? null) && is_array($current['nova'] ?? null)) {
+            $merged['nova'] = $this->mergeMaps($defaults['nova'], $current['nova']);
+        }
+
+        return $merged;
+    }
+
+    /**
+     * @param  array<string, mixed>  $defaults
+     * @param  array<string, mixed>  $current
+     * @return array<string, mixed>
+     */
+    private function mergeMaps(array $defaults, array $current): array
+    {
+        $merged = array_merge($defaults, $current);
+
+        foreach (self::MAPS as $map) {
+            if (is_array($defaults[$map] ?? null) && is_array($current[$map] ?? null)) {
+                $merged[$map] = array_merge($defaults[$map], $current[$map]);
+            }
+        }
+
+        return $merged;
     }
 }

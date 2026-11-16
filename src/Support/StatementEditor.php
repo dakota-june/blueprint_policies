@@ -17,7 +17,7 @@ use PhpToken;
  * Only lines carrying the tag are ever touched, so a method's own code is left alone. Each run removes our
  * lines and writes the current set, which makes the edit idempotent and lets removed abilities disappear.
  * Statements may contain `{{ use:Fqcn }}` placeholders, resolved to a short name plus an import (or a
- * leading-backslash name when the short name is taken).
+ * leading-backslash name when the short name is taken). Files with CRLF line endings keep them.
  */
 final class StatementEditor
 {
@@ -45,17 +45,20 @@ final class StatementEditor
         ?string $requiresVariable = null,
         ?string $skipWhenBodyMatches = null,
     ): EditResult {
+        $original = $source;
+        [$source, $eol] = $this->toLf($source);
+
         $tokens = PhpToken::tokenize($source);
         $classIdx = $this->findClass($tokens, $class);
 
         if ($classIdx === null) {
-            return new EditResult($source, false, ["Class [{$class}] was not found; no statements were added to {$method}()."]);
+            return new EditResult($original, false, ["Class [{$class}] was not found; no statements were added to {$method}()."]);
         }
 
         $located = $this->locate($tokens, $classIdx, $method);
 
         if ($located === null) {
-            return new EditResult($source, false, ["{$class}::{$method}() was not found, so no statements were added to it."]);
+            return new EditResult($original, false, ["{$class}::{$method}() was not found, so no statements were added to it."]);
         }
 
         [$functionIdx, $paramsOpen, $paramsClose, $braceOpen, $braceClose] = $located;
@@ -89,14 +92,22 @@ final class StatementEditor
             }
         }
 
-        $newBody = $lines === ''
-            ? $clean
-            : (str_starts_with($clean, "\n") ? "\n" . $lines . substr($clean, 1) : "\n" . $lines . $methodIndent);
+        if ($lines === '') {
+            $newBody = $clean;
+        } elseif (str_starts_with($clean, "\n")) {
+            $newBody = "\n" . $lines . substr($clean, 1);
+        } elseif (trim($clean) === '') {
+            $newBody = "\n" . $lines . $methodIndent;
+        } else {
+            // A body written on the brace's own line, e.g. `{ return view('x'); }`: keep its code, move it below ours.
+            $newBody = "\n" . $lines . $methodIndent . '    ' . ltrim($clean);
+        }
 
         $edits[] = [$bodyStart, strlen($body), $newBody];
         $result = $this->apply($source, $edits);
+        $changed = $result !== $source;
 
-        return new EditResult($result, $result !== $source, $notices);
+        return new EditResult($changed ? $this->fromLf($result, $eol) : $original, $changed, $notices);
     }
 
     /**
@@ -106,9 +117,23 @@ final class StatementEditor
      */
     public function strip(string $source, array $uses = []): string
     {
-        $stripped = (string) preg_replace(self::TAG_LINE, '', $source);
+        [$lf, $eol] = $this->toLf($source);
+        $stripped = (string) preg_replace(self::TAG_LINE, '', $lf);
 
-        return $stripped === $source ? $source : $this->removeImportsIfUnused($stripped, $uses);
+        return $stripped === $lf ? $source : $this->fromLf($this->removeImportsIfUnused($stripped, $uses), $eol);
+    }
+
+    /**
+     * Removes the given imports when nothing in the file uses them, whether or not there are tagged statements left.
+     *
+     * @param  array<int, string>  $uses
+     */
+    public function removeUnusedImports(string $source, array $uses): string
+    {
+        [$lf, $eol] = $this->toLf($source);
+        $cleaned = $this->removeImportsIfUnused($lf, $uses);
+
+        return $cleaned === $lf ? $source : $this->fromLf($cleaned, $eol);
     }
 
     /** True when the source still has tagged statements in it. */

@@ -47,12 +47,24 @@ abstract class TestCase extends Orchestra
         parent::tearDown();
     }
 
+    /**
+     * Removes what the tests generate and nothing else: Testbench's skeleton keeps its own files under app/
+     * (the base Controller, the User model ...), and those must survive a run.
+     */
     private function clean(): void
     {
         $files = new Filesystem();
 
-        foreach (['app/Policies', 'app/Auth', 'app/Http/Controllers', 'app/Http/Requests'] as $directory) {
+        foreach (['app/Policies', 'app/Auth', 'app/Nova', 'app/Http/Controllers/Admin'] as $directory) {
             $files->deleteDirectory(base_path($directory));
+        }
+
+        foreach (['Post', 'Comment', 'Tag', 'User'] as $name) {
+            @unlink(base_path("app/Http/Controllers/{$name}Controller.php"));
+
+            foreach (glob(base_path("app/Http/Requests/{$name}*Request.php")) ?: [] as $request) {
+                @unlink($request);
+            }
         }
 
         foreach (['Post', 'Comment', 'Tag'] as $model) {
@@ -101,6 +113,20 @@ abstract class TestCase extends Orchestra
         return $draft;
     }
 
+    /**
+     * The fixture draft with a `nova_policies:` section.
+     *
+     * @param  array<string, mixed>|string  $nova  the `nova_policies:` section
+     * @param  array<string, mixed>|string  $policies  the `policies:` section; empty by default so a test sees only Nova output
+     */
+    protected function novaDraft(array|string $nova, array|string $policies = []): array
+    {
+        $draft = $this->draft($policies);
+        $draft['nova_policies'] = $nova;
+
+        return $draft;
+    }
+
     /** Minimal model files, for tests that register policies on models. */
     protected function writeModels(): void
     {
@@ -112,5 +138,22 @@ abstract class TestCase extends Orchestra
 
         @mkdir(base_path('app/Providers'), 0777, true);
         file_put_contents(base_path('app/Providers/PolicyTestProvider.php'), "<?php\n\nnamespace App\\Providers;\n\nuse Illuminate\\Support\\ServiceProvider;\n\nclass PolicyTestProvider extends ServiceProvider\n{\n    public function register(): void\n    {\n    }\n\n    public function boot(): void\n    {\n        //\n    }\n}\n");
+    }
+
+    /**
+     * Minimal Nova resource files (app/Nova/Post.php ...), for tests that register policies on resources.
+     *
+     * @param  array<int, string>  $names
+     */
+    protected function writeNovaResources(array $names = ['Post', 'Comment', 'Tag']): void
+    {
+        @mkdir(base_path('app/Nova'), 0777, true);
+
+        foreach ($names as $name) {
+            file_put_contents(
+                base_path("app/Nova/{$name}.php"),
+                "<?php\n\nnamespace App\\Nova;\n\nuse Laravel\\Nova\\Resource;\n\nclass {$name} extends Resource\n{\n    public static \$model = \\App\\Models\\{$name}::class;\n\n    public static \$title = 'id';\n}\n",
+            );
+        }
     }
 }

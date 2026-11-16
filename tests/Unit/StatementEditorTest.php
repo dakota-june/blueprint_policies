@@ -63,6 +63,21 @@ it('fills an empty method body', function () {
         ->and(lints($result->source))->toBeTrue();
 });
 
+it('keeps the code of a method whose body starts on the brace line', function () {
+    $source = str_replace(
+        "    public function show(Request \$request, Post \$post)\n    {\n        return view('post.show', compact('post'));\n    }",
+        "    public function show(Request \$request, Post \$post) { return view('post.show', compact('post')); }",
+        CONTROLLER,
+    );
+    $editor = new StatementEditor();
+    $result = $editor->insert($source, 'PostController', 'show', ["Gate::authorize('view', \$post);"], 'post');
+
+    expect($result->source)->toContain("return view('post.show', compact('post'));")
+        ->toContain("Gate::authorize('view', \$post); // @generated blueprint_policies")
+        ->and(lints($result->source))->toBeTrue()
+        ->and($editor->strip($result->source))->toContain("return view('post.show', compact('post'));")->not->toContain('@generated');
+});
+
 it('skips a method that lacks the parameter, has no body, or already authorizes', function () {
     $editor = new StatementEditor();
 
@@ -88,6 +103,15 @@ it('strip() restores the original byte for byte', function () {
     $wired = $editor->insert($wired, 'PostController', 'show', ["Gate::authorize('view', \$post);"], 'post')->source;
 
     expect($editor->strip($wired, ['Illuminate\Support\Facades\Gate']))->toBe(CONTROLLER);
+});
+
+it('removeUnusedImports() drops an import nothing uses, and keeps one that is used', function () {
+    $editor = new StatementEditor();
+    $wired = $editor->insert(CONTROLLER, 'PostController', 'index', [GATE_INDEX])->source;
+    $lines = preg_replace('/^.*@generated blueprint_policies\n/m', '', $wired);   // lines gone, the Gate import left behind
+
+    expect($editor->removeUnusedImports($lines, ['Illuminate\Support\Facades\Gate']))->toBe(CONTROLLER)
+        ->and($editor->removeUnusedImports($wired, ['Illuminate\Support\Facades\Gate']))->toBe($wired);
 });
 
 it('uses a leading backslash when the short name is taken', function () {

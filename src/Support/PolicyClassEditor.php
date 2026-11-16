@@ -9,7 +9,7 @@ use Dakotajune\BlueprintPolicies\Support\Concerns\ResolvesNames;
 use PhpToken;
 
 /**
- * Edits a Nova policy file in place under one strict rule:
+ * Edits a policy file (or any class that holds tagged members) in place under one strict rule:
  *
  *   The generator owns exactly the properties and methods tagged `@generated blueprint_policies`.
  *   Nothing else is ever modified or removed.
@@ -25,7 +25,8 @@ use PhpToken;
  *
  * Member sources may contain `{{ use:Fully\Qualified\Name }}` placeholders. They become the short name when the
  * class can be imported (or lives in the file's namespace) and the fully qualified name when the short name is
- * already taken by something else, so generated code never silently refers to the wrong class.
+ * already taken by something else, so generated code never silently refers to the wrong class. Imports are only
+ * added for members that are actually written. Files with CRLF line endings keep them.
  */
 final class PolicyClassEditor
 {
@@ -50,12 +51,15 @@ final class PolicyClassEditor
         array $methods,
         array $imports = [],
     ): EditResult {
+        $original = $source;
+        [$source, $eol] = $this->toLf($source);
+
         $tokens = PhpToken::tokenize($source);
         $classIdx = $this->findClass($tokens, $class);
         $scan = $classIdx === null ? null : $this->scan($tokens, $source, $classIdx);
 
         if ($classIdx === null || $scan === null) {
-            return new EditResult($source, false, ["Class [{$class}] was not found in the policy file; it was left untouched."]);
+            return new EditResult($original, false, ["Class [{$class}] was not found in the policy file; it was left untouched."]);
         }
 
         $notices = [];
@@ -84,12 +88,24 @@ final class PolicyClassEditor
             $newImports[] = $import;
         }
 
+        // A member of the same name that the developer owns is never written, so it must not cause an import either.
+        $owned = [];
+        foreach ($scan['members'] as $member) {
+            if (! $member['generated']) {
+                $owned[$this->keyOf($member)] = true;
+            }
+        }
+
         // Plain loops, not array_map(fn …): arrow functions capture by value and could not record the imports.
         foreach ($properties as $name => $text) {
-            $properties[$name] = $this->expand($text, $namespace, $known, $newImports);
+            if (! isset($owned['property:' . $name])) {
+                $properties[$name] = $this->expand($text, $namespace, $known, $newImports);
+            }
         }
         foreach ($methods as $name => $text) {
-            $methods[$name] = $this->expand($text, $namespace, $known, $newImports);
+            if (! isset($owned['method:' . strtolower($name)])) {
+                $methods[$name] = $this->expand($text, $namespace, $known, $newImports);
+            }
         }
 
         $wanted = [];
@@ -170,19 +186,23 @@ final class PolicyClassEditor
         }
 
         $result = $this->apply($source, $edits);
+        $changed = $result !== $source;
 
-        return new EditResult($result, $result !== $source, $notices);
+        return new EditResult($changed ? $this->fromLf($result, $eol) : $original, $changed, $notices);
     }
 
     /** Removes every generated member; developer members, imports and everything else stay exactly as they are. */
     public function stripGenerated(string $source, string $class): string
     {
+        $original = $source;
+        [$source, $eol] = $this->toLf($source);
+
         $tokens = PhpToken::tokenize($source);
         $classIdx = $this->findClass($tokens, $class);
         $scan = $classIdx === null ? null : $this->scan($tokens, $source, $classIdx);
 
         if ($scan === null) {
-            return $source;
+            return $original;
         }
 
         $ranges = [];
@@ -192,19 +212,18 @@ final class PolicyClassEditor
             }
         }
 
-        return $this->apply($source, array_map(
+        $result = $this->apply($source, array_map(
             static fn (array $r): array => [$r[0], $r[1] - $r[0], ''],
             $this->mergeRanges($ranges, $source),
         ));
+
+        return $result === $source ? $original : $this->fromLf($result, $eol);
     }
 
-    /**
-     * True when the class body holds anything other than generated members and, when $seedHash is given, a
-     * `fields()` method that is still exactly what was first written.
-     */
-    public function hasDeveloperContent(string $source, string $class, ?string $seedHash = null): bool
+    /** True when the class body holds anything other than generated members. */
+    public function hasDeveloperContent(string $source, string $class): bool
     {
-        $stripped = $this->stripGenerated($source, $class);
+        [$stripped] = $this->toLf($this->stripGenerated($source, $class));
         $tokens = PhpToken::tokenize($stripped);
         $classIdx = $this->findClass($tokens, $class);
         $scan = $classIdx === null ? null : $this->scan($tokens, $stripped, $classIdx);
@@ -213,49 +232,10 @@ final class PolicyClassEditor
             return false;
         }
 
-        if ($seedHash !== null) {
-            $ranges = [];
-            foreach ($scan['members'] as $member) {
-                if ($member['kind'] === 'method' && strtolower($member['name']) === 'fields'
-                    && $this->hash(substr($stripped, $member['start'], $member['end'] - $member['start'])) === $seedHash) {
-                    $ranges[] = $this->deletionRange($stripped, $member['start'], $member['end']);
-                }
-            }
-
-            $stripped = $this->apply($stripped, array_map(
-                static fn (array $r): array => [$r[0], $r[1] - $r[0], ''],
-                $this->mergeRanges($ranges, $stripped),
-            ));
-
-            $tokens = PhpToken::tokenize($stripped);
-            $classIdx = $this->findClass($tokens, $class);
-            $scan = $classIdx === null ? null : $this->scan($tokens, $stripped, $classIdx);
-
-            if ($scan === null) {
-                return false;
-            }
-        }
-
         $from = $tokens[$scan['open']]->pos + 1;
         $to = $tokens[$scan['close']]->pos;
 
         return trim(substr($stripped, $from, $to - $from)) !== '';
-    }
-
-    /** Whitespace-insensitive hash of one method, or null when it does not exist. Used to spot an untouched seed. */
-    public function methodHash(string $source, string $class, string $method): ?string
-    {
-        $tokens = PhpToken::tokenize($source);
-        $classIdx = $this->findClass($tokens, $class);
-        $scan = $classIdx === null ? null : $this->scan($tokens, $source, $classIdx);
-
-        foreach ($scan['members'] ?? [] as $member) {
-            if ($member['kind'] === 'method' && strtolower($member['name']) === strtolower($method)) {
-                return $this->hash(substr($source, $member['start'], $member['end'] - $member['start']));
-            }
-        }
-
-        return null;
     }
 
     // =====================================================================================================
@@ -562,10 +542,5 @@ final class PolicyClassEditor
         }
 
         return $merged;
-    }
-
-    private function hash(string $memberSource): string
-    {
-        return sha1((string) preg_replace('/\s+/', ' ', trim($memberSource)));
     }
 }

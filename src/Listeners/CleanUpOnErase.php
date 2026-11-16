@@ -7,9 +7,8 @@ namespace Dakotajune\BlueprintPolicies\Listeners;
 use Dakotajune\BlueprintPolicies\Support\BlueprintFile;
 use Dakotajune\BlueprintPolicies\Support\ManifestStore;
 use Dakotajune\BlueprintPolicies\Support\NoticeBag;
-use Dakotajune\BlueprintPolicies\Support\PolicyAttributeInjector;
 use Dakotajune\BlueprintPolicies\Support\PolicyClassEditor;
-use Dakotajune\BlueprintPolicies\Support\StatementEditor;
+use Dakotajune\BlueprintPolicies\Support\WiringReverter;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Filesystem\Filesystem;
 
@@ -18,17 +17,16 @@ use Illuminate\Filesystem\Filesystem;
  * Just before it starts, this puts our changes back, using the manifest written at build time:
  *
  *  - tagged authorize statements are removed from controllers, Gate::policy() lines from the provider,
- *    and #[UsePolicy] from models (each only where it names our policy);
- *  - policy files lose their generated abilities; a policy that still holds your code, or that we did not
- *    create, is taken off erase's delete list (`.blueprint` is edited, backed up first) so it survives.
+ *    #[UsePolicy] from models and `$policy` from Nova resources (each only where it names our policy);
+ *  - policy files (web and Nova alike) lose their generated abilities; a policy that still holds your code, or that
+ *    we did not create, is taken off erase's delete list (`.blueprint` is edited, backed up first) so it survives.
  */
 final class CleanUpOnErase
 {
     public function __construct(
         private readonly Filesystem $files,
         private readonly PolicyClassEditor $policies,
-        private readonly StatementEditor $statements,
-        private readonly PolicyAttributeInjector $attributes,
+        private readonly WiringReverter $reverter,
         private readonly ManifestStore $manifests,
         private readonly BlueprintFile $blueprintFile,
         private readonly NoticeBag $notices,
@@ -47,15 +45,19 @@ final class CleanUpOnErase
         }
 
         foreach ($manifest->controllers() as $path => $meta) {
-            $this->edit($path, fn (string $source): string => $this->statements->strip($source, $meta['uses']));
+            $this->reverter->controller($path, $meta);
         }
 
         foreach ($manifest->providers() as $path => $meta) {
-            $this->edit($path, fn (string $source): string => $this->statements->strip($source, $meta['uses']));
+            $this->reverter->provider($path, $meta);
         }
 
         foreach ($manifest->models() as $path => $meta) {
-            $this->edit($path, fn (string $source): string => $this->attributes->remove($source, $meta['class'], $meta['policy'], $meta['uses']));
+            $this->reverter->model($path, $meta);
+        }
+
+        foreach ($manifest->resources() as $path => $meta) {
+            $this->reverter->resource($path, $meta);
         }
 
         $protect = [];
@@ -85,22 +87,5 @@ final class CleanUpOnErase
         }
 
         $this->manifests->delete();
-    }
-
-    /** @param  callable(string): string  $change */
-    private function edit(string $path, callable $change): void
-    {
-        $absolute = base_path($path);
-
-        if (! $this->files->exists($absolute)) {
-            return;
-        }
-
-        $source = $this->files->get($absolute);
-        $changed = $change($source);
-
-        if ($changed !== $source) {
-            $this->files->put($absolute, $changed);
-        }
     }
 }
