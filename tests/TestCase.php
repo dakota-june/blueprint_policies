@@ -33,6 +33,8 @@ abstract class TestCase extends Orchestra
 
         config([
             'blueprint.policy_namespace' => 'Policies',
+            // Testbench's default user model is Illuminate\Foundation\Auth\User; pin the usual app one.
+            'blueprint_policies.user_model' => 'App\\Models\\User',
             'blueprint_policies.provider' => 'app/Providers/PolicyTestProvider.php',
         ]);
     }
